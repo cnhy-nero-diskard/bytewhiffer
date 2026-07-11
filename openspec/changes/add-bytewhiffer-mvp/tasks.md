@@ -100,7 +100,9 @@
       *(partially evidenced: hover/hit-testing verified with a real pointer,
       drilled-in state verified via the debug-screenshot `drill` mode;
       real mouse click-to-drill and context-menu still need human hands —
-      run `cargo run` and click around)*
+      run `cargo run` and click around. As of 2026-07-11 a native Windows
+      build also exists at `target\release\bytewhiffer.exe`, so this pass can
+      be done on either side)*
 
 ## 6. File actions
 
@@ -115,10 +117,21 @@
 - [x] 6.3 Implement the Open action (OS default handler for the target)
 - [x] 6.4 Implement the Reveal in Explorer action *(Windows: `explorer
       /select,`; non-Windows dev fallback: open the containing folder)*
-- [ ] **[Windows checkpoint]** 6.5 Verify Reveal in Explorer opens the real
+- [x] **[Windows checkpoint]** 6.5 Verify Reveal in Explorer opens the real
       Explorer shell with the item selected, on an actual Windows session
-- [ ] **[Windows checkpoint]** 6.6 Verify Delete's real recycle-bin/removal
+      *(verified 2026-07-11 on the real Windows 11 session: ran the exact
+      `explorer /select,"<path>"` invocation from `reveal_in_file_manager`
+      against a path containing spaces, then confirmed via the Shell COM API
+      that an Explorer window opened at the containing folder with the target
+      file selected — `Document.SelectedItems()` returned exactly the target)*
+- [x] **[Windows checkpoint]** 6.6 Verify Delete's real recycle-bin/removal
       semantics on an actual Windows session
+      *(verified 2026-07-11 on the real Windows 11 session via a scratch
+      harness calling the app's exact `trash::delete(&fs_path)` path: success
+      case — file gone from disk, present in the Recycle Bin shell namespace
+      with correct original location, and restorable from it; failure case —
+      an exclusively-locked file returned `Err` with the file left intact,
+      which the app surfaces as the error modal per spec)*
 
 ## 7. Theming
 
@@ -149,6 +162,20 @@
       intended *(scan/live-fill/hover/drilled-state/theming all evidenced by
       the three debug screenshots; the remaining human part is the same as
       5.6 — real clicks)*
-- [ ] **[Windows checkpoint]** 8.3 Build/run the Windows target build at
+- [x] **[Windows checkpoint]** 8.3 Build/run the Windows target build at
       least once end-to-end (scan, navigate, all three actions) on a real
       Windows session before considering the MVP done
+      *(done 2026-07-11 on the real Windows 11 session. Toolchain: rustup
+      stable-x86_64-pc-windows-gnu — no MSVC Build Tools on this machine, and
+      rustup's self-contained mingw lacks a working `dlltool`, so WinLibs
+      mingw-w64 (winget `BrechtSanders.WinLibs.POSIX.UCRT`, portable/user-
+      scoped) supplies binutils on PATH for the build. Release build clean;
+      all 22 native tests pass (the 23rd is `#[cfg(unix)]`-only). Ran the
+      built exe in all three debug-screenshot modes against the repo tree
+      (3.9 GB): final map, live-fill capture, and drill mode showing the
+      `bytewhiffer › target` breadcrumb all render correctly. All three
+      actions' Windows mechanics verified from the same session — Reveal
+      (6.5), Delete/recycle-bin (6.6), and Open (folder target opened its
+      Explorer window, confirmed and closed via Shell COM). Remaining human
+      nicety — really clicking the menu items inside the app window — is the
+      same residue tracked by 5.6/8.2.)*
