@@ -6,7 +6,7 @@
 //! shown as a subtle lightness shift, and one reserved accent color that
 //! only ever means "interactive": hover, the active breadcrumb, selection.
 
-use eframe::egui::{self, Color32};
+use eframe::egui::{self, epaint::Shadow, Color32};
 
 /// App/treemap background. `#0d1117` — same family as GitHub dark.
 pub const BG: Color32 = Color32::from_rgb(0x0d, 0x11, 0x17);
@@ -21,6 +21,10 @@ pub const TEXT_SUBTLE: Color32 = Color32::from_rgb(0x8b, 0x94, 0x9e);
 pub const ACCENT: Color32 = Color32::from_rgb(0x58, 0xa6, 0xff);
 /// Hairline borders between treemap blocks. `#010409`-ish, darker than BG.
 pub const BLOCK_BORDER: Color32 = Color32::from_rgb(0x01, 0x04, 0x09);
+/// Idle fill base for chrome surfaces (toolbar buttons, path field,
+/// breadcrumb chips) — a muted slate that takes the same gradient/shadow
+/// treatment as treemap blocks so the chrome reads as one system with the map.
+pub const CHROME_BASE: Color32 = Color32::from_rgb(0x1b, 0x22, 0x2d);
 
 /// Saturation/value band every extension-derived block color lives in.
 /// Keeping these fixed (only hue varies) is what makes the palette cohere.
@@ -34,9 +38,72 @@ const DIR_SATURATION: f32 = 0.25;
 const DIR_VALUE: f32 = 0.30;
 
 /// Per-level lightness lift that communicates nesting depth. Subtle on
-/// purpose; capped so deep trees don't wash out to white.
+/// purpose; capped so deep trees don't wash out to white. Retained as a
+/// *secondary* cue layered under the elevation treatment below — the spec
+/// asks for depth via elevation "rather than a lightness shift alone", not
+/// for the lightness shift to be removed.
 const DEPTH_LIFT: f32 = 0.035;
 const DEPTH_LIFT_MAX: f32 = 0.18;
+
+// --- Soft-elevation treatment -------------------------------------------
+// Blocks and chrome read as raised cards: a top-lighter/bottom-darker
+// gradient fill, a soft drop shadow, and a modest corner radius. These
+// values are implementation-time tuning (per the change's design doc), set
+// against the running app via `--debug-screenshot*` and validated for
+// tessellation cost by the `--debug-perf` spike.
+
+/// Corner radius for raised cards and chrome elements.
+pub const CARD_CORNER_RADIUS: f32 = 4.0;
+/// Corner radius for a directory's recessed tray (slightly softer).
+pub const TRAY_CORNER_RADIUS: f32 = 5.0;
+
+/// How far the top of a card's gradient is lifted toward white, and its
+/// bottom pushed toward black. Small enough to read as a sheen, not a
+/// second color.
+const GRAD_LIGHTEN: f32 = 0.13;
+const GRAD_DARKEN: f32 = 0.16;
+
+/// Soft drop shadow cast by a raised card. Blurred (not hard-edged) per the
+/// design decision; kept small so the penumbra stays tight on small cards.
+const SHADOW_OFFSET: [i8; 2] = [0, 2];
+const SHADOW_BLUR: u8 = 7;
+const SHADOW_SPREAD: u8 = 0;
+const SHADOW_ALPHA: u8 = 110;
+
+/// A directory renders as a shallow recessed tray. Its body is darker than
+/// the surrounding surface so raised child cards (and their shadows) read as
+/// floating above it.
+pub const TRAY_FILL: Color32 = Color32::from_rgb(0x08, 0x0b, 0x10);
+/// Colour of the short inner top shadow that sells the "recessed" look.
+pub fn tray_inset_shadow() -> Color32 {
+    Color32::from_black_alpha(90)
+}
+
+/// Top/bottom gradient stops for a card of the given base colour: lighter at
+/// the top, darker at the bottom. Hue is untouched — this shades the fixed
+/// per-extension colour, it does not pick a new one.
+pub fn gradient_stops(base: Color32) -> (Color32, Color32) {
+    let top = base.lerp_to_gamma(Color32::WHITE, GRAD_LIGHTEN);
+    let bottom = base.lerp_to_gamma(Color32::BLACK, GRAD_DARKEN);
+    (top, bottom)
+}
+
+/// The soft drop shadow cast by a raised card.
+pub fn card_shadow() -> Shadow {
+    Shadow {
+        offset: SHADOW_OFFSET,
+        blur: SHADOW_BLUR,
+        spread: SHADOW_SPREAD,
+        color: Color32::from_black_alpha(SHADOW_ALPHA),
+    }
+}
+
+/// The header strip colour for a directory tray: its muted-slate base,
+/// lifted by depth like any block, then brightened a touch so the name
+/// strip reads as the tray's "label bar" above the darker body.
+pub fn tray_header_color(name: &str, depth: usize) -> Color32 {
+    depth_shift(base_block_color(name, true), depth).lerp_to_gamma(Color32::WHITE, 0.06)
+}
 
 /// Installs the dark theme on the egui context. Called once at startup.
 pub fn apply(ctx: &egui::Context) {
@@ -47,6 +114,20 @@ pub fn apply(ctx: &egui::Context) {
     visuals.override_text_color = Some(TEXT);
     visuals.selection.bg_fill = ACCENT.linear_multiply(0.4);
     visuals.hyperlink_color = ACCENT;
+    // Round any remaining stock widgets (tooltips, the error window, the
+    // scan spinner's frame) to match the card corner radius, so nothing in
+    // the app carries the old hard-cornered Win32 look.
+    let radius = egui::CornerRadius::from(CARD_CORNER_RADIUS as u8);
+    for w in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        w.corner_radius = radius;
+    }
+    visuals.window_corner_radius = egui::CornerRadius::from(TRAY_CORNER_RADIUS as u8);
     ctx.set_visuals(visuals);
 }
 
@@ -147,6 +228,32 @@ mod tests {
         assert!(d3.r() >= d1.r());
         // Deep nesting stops getting lighter at the cap.
         assert_eq!(depth_shift(base, 50), depth_shift(base, 100));
+    }
+
+    #[test]
+    fn gradient_stops_bracket_the_base_in_lightness() {
+        // The elevation treatment shades a block's fixed colour into a
+        // top-lighter/bottom-darker pair; it must not invert or flatten.
+        let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+        for ext in ["rs", "png", "exe", "zip", ""] {
+            let base = color_for_extension(ext);
+            let (top, bottom) = gradient_stops(base);
+            assert!(lum(top) > lum(base), "{ext}: top should be lighter than base");
+            assert!(
+                lum(bottom) < lum(base),
+                "{ext}: bottom should be darker than base"
+            );
+        }
+    }
+
+    #[test]
+    fn card_shadow_is_soft_not_hard_edged() {
+        // The design chose a blurred penumbra over a hard-edged offset rect;
+        // the perf spike confirmed the cost is acceptable. Lock that in.
+        assert!(
+            card_shadow().blur > 0,
+            "elevation uses a soft blurred shadow, not a hard-edged one"
+        );
     }
 
     #[test]

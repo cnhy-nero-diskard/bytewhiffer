@@ -30,7 +30,10 @@ Output lands at `target/release/bytewhiffer.exe`. Release builds set `windows_su
 bytewhiffer --debug-screenshot <out.png> <scan-path>        # capture after scan completes
 bytewhiffer --debug-screenshot-live <out.png> <scan-path>   # capture mid-scan, map partially filled
 bytewhiffer --debug-screenshot-drill <out.png> <scan-path>  # capture drilled into the largest child dir
+bytewhiffer --debug-perf                                    # headless tessellation bench: flat baseline vs soft-elevation, prints to stdout
 ```
+
+`--debug-perf` is a GUI-subsystem binary so it has no console of its own — redirect its stdout to read it: `Start-Process ... -RedirectStandardOutput perf.txt`. It runs the de-risking spike from the `soft-elevation-theming` change (flat-fill vs shadow+gradient cost on synthetic dense trees) and is the tool to re-run if the card rendering ever changes.
 
 ## Architecture
 

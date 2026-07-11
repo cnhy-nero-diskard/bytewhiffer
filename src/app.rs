@@ -26,6 +26,19 @@ const MAX_DEPTH: usize = 10;
 /// Vertical space reserved for a directory's name strip when nesting into it.
 const DIR_LABEL_H: f32 = 16.0;
 const BLOCK_PAD: f32 = 2.0;
+/// Below this on-screen side length a block (or chrome element) renders with
+/// flat fill only — no shadow, gradient, corner radius, or gap — matching the
+/// pre-elevation look. Sits alongside `MIN_NEST_AREA`/`MIN_NEST_SIDE` as a
+/// legibility/perf floor: dense clusters of tiny blocks would otherwise turn a
+/// blurred shadow + rounded gradient on every one of them into visual mush.
+const MIN_CARD_SIDE: f32 = 22.0;
+/// Gap inset applied to a raised card so its neighbours' drop shadows show
+/// through. Flat-fallback blocks below `MIN_CARD_SIDE` skip this (no gap).
+const CARD_GAP: f32 = 1.5;
+/// Padding of a directory tray's recessed well around the child cards it
+/// holds, so a rim of the dark tray body (and its inset top shadow) frames
+/// the floating children.
+const TRAY_PAD: f32 = 3.0;
 
 /// UI-side mirror of the scan tree. Built incrementally from `ScanEvent`s
 /// while a scan runs (so the map fills in live), then swapped wholesale for
@@ -328,25 +341,39 @@ impl BytewhifferApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("📁 Pick folder…").clicked() {
+            ui.spacing_mut().item_spacing.x = 6.0;
+
+            if chrome_button(ui, "📁 Pick folder…", true).clicked() {
                 if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                     self.path_input = folder.to_string_lossy().into_owned();
                     self.start_scan(folder);
                 }
             }
 
+            // Path field: a recessed (darkened) card background with a
+            // frameless text edit placed on top, so it wears the same
+            // radius/shadow language as the buttons and the map.
+            let (field_rect, _) = ui.allocate_exact_size(Vec2::new(320.0, 28.0), Sense::hover());
+            paint_surface(
+                ui.painter(),
+                field_rect,
+                theme::CHROME_BASE.lerp_to_gamma(egui::Color32::BLACK, 0.35),
+            );
+            let inner = field_rect.shrink2(Vec2::new(8.0, 4.0));
             let edit = egui::TextEdit::singleline(&mut self.path_input)
                 .hint_text("…or type a path")
-                .desired_width(320.0);
-            let path_response = ui.add(edit);
+                .frame(egui::Frame::NONE);
+            let path_response = ui.put(inner, edit);
             let submitted =
                 path_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.button("Scan").clicked() || submitted) && !self.path_input.trim().is_empty() {
+            if (chrome_button(ui, "Scan", true).clicked() || submitted)
+                && !self.path_input.trim().is_empty()
+            {
                 self.start_scan(PathBuf::from(self.path_input.trim()));
             }
 
             if let Some(scan) = &self.scan {
-                if ui.button("Cancel").clicked() {
+                if chrome_button(ui, "Cancel", true).clicked() {
                     scan.ctx.cancel.store(true, Ordering::Relaxed);
                 }
                 ui.spinner();
@@ -372,37 +399,25 @@ impl BytewhifferApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
 
-            let back = ui
-                .add_enabled(!self.focus.is_empty(), egui::Button::new("⬅"))
-                .on_hover_text("Back to parent");
+            let back = chrome_button(ui, "⬅", !self.focus.is_empty());
             if back.clicked() {
                 let mut f = self.focus.clone();
                 f.pop();
                 new_focus = Some(f);
             }
 
-            // Root crumb, then one crumb per focused level. The *current*
-            // level is the one place (besides hover/selection) that wears
-            // the accent color.
+            // Root crumb, then one crumb per focused level, each an elevated
+            // chip. The *current* level is the one place (besides hover and
+            // selection) that wears the accent color.
             let at_root = self.focus.is_empty();
-            let root_label = egui::RichText::new(&root.name).color(if at_root {
-                theme::ACCENT
-            } else {
-                theme::TEXT_SUBTLE
-            });
-            if ui.link(root_label).clicked() {
+            if chrome_chip(ui, &root.name, at_root).clicked() {
                 new_focus = Some(Vec::new());
             }
 
             for (i, name) in self.focus.iter().enumerate() {
                 ui.colored_label(theme::TEXT_SUBTLE, "›");
                 let is_current = i == self.focus.len() - 1;
-                let label = egui::RichText::new(name).color(if is_current {
-                    theme::ACCENT
-                } else {
-                    theme::TEXT_SUBTLE
-                });
-                if ui.link(label).clicked() {
+                if chrome_chip(ui, name, is_current).clicked() {
                     new_focus = Some(self.focus[..=i].to_vec());
                 }
             }
@@ -474,7 +489,7 @@ impl BytewhifferApp {
         if let Some(hit) = hovered {
             painter.rect_stroke(
                 hit.rect,
-                2.0,
+                theme::CARD_CORNER_RADIUS,
                 Stroke::new(1.5, theme::ACCENT),
                 StrokeKind::Inside,
             );
@@ -692,10 +707,14 @@ impl eframe::App for BytewhifferApp {
     }
 }
 
-/// Recursively draws `node`'s children into `rect`, collecting hit-test
-/// rects along the way. Children are laid out largest-first by the
-/// squarified algorithm; directories big enough to matter nest their own
-/// contents inside, one lightness step up per level.
+/// Recursively draws `node`'s children into `rect`, collecting hit-test rects
+/// along the way. Children are laid out largest-first by the squarified
+/// algorithm. Blocks big enough to read (≥ `MIN_CARD_SIDE`) render as raised
+/// cards — soft drop shadow, top-lighter/bottom-darker gradient, rounded
+/// corners; directories large enough for a title bar render instead as a
+/// recessed tray (dark well + header strip) whose children float above it as
+/// cards. Everything below the threshold falls back to today's flat fill with
+/// no shadow/gradient/radius/gap, so dense clusters stay legible and cheap.
 fn draw_children(
     painter: &egui::Painter,
     node: &Node,
@@ -724,16 +743,31 @@ fn draw_children(
         if r.w < 2.0 || r.h < 2.0 {
             continue;
         }
-        let block = Rect::from_min_size(Pos2::new(r.x, r.y), Vec2::new(r.w, r.h)).shrink(0.5);
+        let raw = Rect::from_min_size(Pos2::new(r.x, r.y), Vec2::new(r.w, r.h));
+        // Card-eligible blocks earn a gap so neighbours' shadows show; flat
+        // fallbacks keep today's tight 0.5px seam.
+        let card_eligible = raw.width() >= MIN_CARD_SIDE && raw.height() >= MIN_CARD_SIDE;
+        let block = raw.shrink(if card_eligible { CARD_GAP } else { 0.5 });
 
-        let color = theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
-        painter.rect_filled(block, 2.0, color);
-        painter.rect_stroke(
-            block,
-            2.0,
-            Stroke::new(1.0, theme::BLOCK_BORDER),
-            StrokeKind::Inside,
-        );
+        let base = theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
+        // A directory renders as a tray (header + recessed well) whenever
+        // there's room for its title bar; otherwise it's a plain card.
+        let tray = child.is_dir && card_eligible && block.height() >= DIR_LABEL_H + 8.0;
+
+        if tray {
+            draw_tray_shell(painter, block, &child.name, depth);
+        } else if card_eligible {
+            paint_card(painter, block, base);
+        } else {
+            // Flat fallback: identical to the pre-elevation rendering.
+            painter.rect_filled(block, 0.0, base);
+            painter.rect_stroke(
+                block,
+                0.0,
+                Stroke::new(1.0, theme::BLOCK_BORDER),
+                StrokeKind::Inside,
+            );
+        }
 
         trail.push(child.name.clone());
         hits.push(HitRect {
@@ -744,11 +778,13 @@ fn draw_children(
             size: child.size,
         });
 
-        let label_fits = block.width() > 48.0 && block.height() > DIR_LABEL_H + 2.0;
+        // Trays carry their name in the header strip; cards/flat blocks get a
+        // corner label when there's room.
+        let label_fits = !tray && block.width() > 48.0 && block.height() > DIR_LABEL_H + 2.0;
         if label_fits {
             let label_painter = painter.with_clip_rect(block);
             label_painter.text(
-                block.left_top() + Vec2::new(4.0, 2.0),
+                block.left_top() + Vec2::new(6.0, 3.0),
                 Align2::LEFT_TOP,
                 &child.name,
                 FontId::proportional(11.0),
@@ -756,20 +792,524 @@ fn draw_children(
             );
         }
 
-        let nestable = child.is_dir
+        let nestable = tray
             && depth < MAX_DEPTH
             && block.area() > MIN_NEST_AREA
             && block.width() > MIN_NEST_SIDE
             && block.height() > MIN_NEST_SIDE + DIR_LABEL_H;
         if nestable {
+            // Children float within the recessed well, inset by the tray rim.
             let inner = Rect::from_min_max(
-                block.left_top() + Vec2::new(BLOCK_PAD, if label_fits { DIR_LABEL_H } else { BLOCK_PAD }),
-                block.right_bottom() - Vec2::new(BLOCK_PAD, BLOCK_PAD),
+                Pos2::new(block.left() + TRAY_PAD, block.top() + DIR_LABEL_H + TRAY_PAD),
+                Pos2::new(block.right() - TRAY_PAD, block.bottom() - TRAY_PAD),
             );
             draw_children(painter, child, inner, depth + 1, trail, hits);
         }
 
         trail.pop();
+    }
+}
+
+/// Draws a directory's recessed-tray shell: a dark well, a header strip
+/// carrying the name, and a short inset shadow under the header so the well
+/// reads as carved below the surface. Children (raised cards) are drawn
+/// afterward, on top, appearing to float within it.
+fn draw_tray_shell(painter: &egui::Painter, block: Rect, name: &str, depth: usize) {
+    painter.rect_filled(block, theme::TRAY_CORNER_RADIUS, theme::TRAY_FILL);
+
+    let header = Rect::from_min_max(
+        block.left_top(),
+        Pos2::new(block.right(), block.top() + DIR_LABEL_H),
+    );
+    painter.rect_filled(header, theme::TRAY_CORNER_RADIUS, theme::tray_header_color(name, depth));
+    let label_painter = painter.with_clip_rect(header);
+    label_painter.text(
+        header.left_top() + Vec2::new(6.0, 2.0),
+        Align2::LEFT_TOP,
+        name,
+        FontId::proportional(11.0),
+        theme::TEXT,
+    );
+
+    // Inset shadow: a short dark→transparent fade just below the header,
+    // spanning the well, drawn before the children so it frames their top.
+    let inset = Rect::from_min_max(
+        Pos2::new(block.left() + TRAY_PAD, block.top() + DIR_LABEL_H),
+        Pos2::new(block.right() - TRAY_PAD, block.top() + DIR_LABEL_H + TRAY_PAD + 4.0),
+    );
+    if inset.height() > 1.0 && inset.width() > 1.0 {
+        painter.add(egui::Shape::mesh(gradient_mesh(
+            inset,
+            0.0,
+            theme::tray_inset_shadow(),
+            egui::Color32::TRANSPARENT,
+        )));
+    }
+}
+
+/// Builds a rounded rectangle filled with a vertical top→bottom colour
+/// gradient. egui has no gradient-fill primitive, so this hand-rolls a
+/// triangle fan over the rounded-rect perimeter (via epaint's own path
+/// helper) with per-vertex colour interpolated by height — the renderer
+/// interpolates between vertices, giving a smooth sheen with real rounded
+/// corners. `top` is used at `rect.top()`, `bottom` at `rect.bottom()`.
+fn gradient_mesh(rect: Rect, radius: f32, top: egui::Color32, bottom: egui::Color32) -> egui::Mesh {
+    use egui::epaint::{tessellator::path, CornerRadiusF32};
+
+    let mut perimeter: Vec<Pos2> = Vec::new();
+    path::rounded_rectangle(&mut perimeter, rect, CornerRadiusF32::same(radius));
+
+    let mut mesh = egui::Mesh::default();
+    if perimeter.len() < 3 {
+        return mesh;
+    }
+    let height = rect.height().max(1.0);
+    let color_at = |y: f32| top.lerp_to_gamma(bottom, ((y - rect.top()) / height).clamp(0.0, 1.0));
+
+    // Center vertex (index 0), then the perimeter, fan-triangulated. A
+    // rounded rect is convex, so a center fan tiles it with no overlap.
+    let center = rect.center();
+    mesh.colored_vertex(center, color_at(center.y));
+    for p in &perimeter {
+        mesh.colored_vertex(*p, color_at(p.y));
+    }
+    let n = perimeter.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    mesh
+}
+
+/// Draws one raised card: soft drop shadow, gradient fill, and a hairline
+/// rounded outline for crispness. `base` is the (already depth-shifted) block
+/// colour.
+fn paint_card(painter: &egui::Painter, rect: Rect, base: egui::Color32) {
+    painter.add(theme::card_shadow().as_shape(rect, theme::CARD_CORNER_RADIUS));
+    let (top, bottom) = theme::gradient_stops(base);
+    painter.add(egui::Shape::mesh(gradient_mesh(
+        rect,
+        theme::CARD_CORNER_RADIUS,
+        top,
+        bottom,
+    )));
+    painter.rect_stroke(
+        rect,
+        theme::CARD_CORNER_RADIUS,
+        Stroke::new(1.0, theme::BLOCK_BORDER),
+        StrokeKind::Inside,
+    );
+}
+
+/// Paints a raised surface for a chrome element, honouring the same size
+/// floor as treemap blocks: elevated (shadow + gradient + rounded) at normal
+/// sizes, flat below `MIN_CARD_SIDE`. Chrome is unlikely to hit the floor in
+/// practice, but the rule is applied for consistency.
+fn paint_surface(painter: &egui::Painter, rect: Rect, base: egui::Color32) {
+    if rect.width() >= MIN_CARD_SIDE && rect.height() >= MIN_CARD_SIDE {
+        paint_card(painter, rect, base);
+    } else {
+        painter.rect_filled(rect, 0.0, base);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.0, theme::BLOCK_BORDER),
+            StrokeKind::Inside,
+        );
+    }
+}
+
+/// A toolbar button drawn with the treemap's elevation language: a raised
+/// gradient/shadow card that leans to the accent colour on hover and presses
+/// darker while held. Returns the click response.
+fn chrome_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    let font = FontId::proportional(13.0);
+    let pad = Vec2::new(12.0, 6.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
+    let size = galley.size() + pad * 2.0;
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+
+    if ui.is_rect_visible(rect) {
+        let hot = enabled && response.hovered();
+        let held = enabled && response.is_pointer_button_down_on();
+        let (base, text_color) = if !enabled {
+            (theme::CHROME_BASE.gamma_multiply(0.5), theme::TEXT_SUBTLE)
+        } else if held {
+            (theme::ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.2), theme::BG)
+        } else if hot {
+            (theme::ACCENT, theme::BG)
+        } else {
+            (theme::CHROME_BASE, theme::TEXT)
+        };
+        paint_surface(ui.painter(), rect, base);
+        let tg = ui
+            .painter()
+            .layout_no_wrap(text.to_owned(), font, text_color);
+        let pos = rect.center() - tg.size() / 2.0;
+        ui.painter().galley(pos, tg, text_color);
+    }
+    response
+}
+
+/// A breadcrumb crumb drawn as a small elevated chip in the same language as
+/// `chrome_button`. `active` (the current focus level) wears the accent, as
+/// does a hovered crumb; other crumbs use the muted chrome base.
+fn chrome_chip(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
+    let font = FontId::proportional(12.0);
+    let pad = Vec2::new(8.0, 4.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
+    let size = galley.size() + pad * 2.0;
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let accent = active || response.hovered();
+        let base = if accent {
+            theme::ACCENT
+        } else {
+            theme::CHROME_BASE
+        };
+        let text_color = if accent { theme::BG } else { theme::TEXT_SUBTLE };
+        paint_surface(ui.painter(), rect, base);
+        let tg = ui
+            .painter()
+            .layout_no_wrap(text.to_owned(), font, text_color);
+        let pos = rect.center() - tg.size() / 2.0;
+        ui.painter().galley(pos, tg, text_color);
+    }
+    response
+}
+
+/// Runs the hidden `--debug-perf` tessellation spike: builds a synthetic
+/// dense tree shaped like the motivating screenshot (a big DLL-heavy system
+/// dir, an installers dir, a dense file mosaic, plus nested app dirs), lays
+/// it out at a typical window size, then tessellates the flat-fill baseline
+/// and the shadow+gradient elevation treatment many times, reporting triangle
+/// counts and per-frame CPU time for each. Headless: no GUI, no display.
+pub fn run_perf_bench() {
+    println!("=== soft-elevation tessellation spike (1280x760) ===");
+    // The motivating scene: a big DLL-heavy dir + installers + a dense mosaic.
+    bench_scene("dense (motivating screenshot)", synth_dense_tree());
+    // Adversarial worst case for the elevation cost: hundreds of similarly
+    // sized blocks all above the card threshold, so almost nothing falls back
+    // to flat and the shadow/gradient cost is paid on every block.
+    bench_scene("all-cards (400 equal mid-size files)", synth_all_cards_tree());
+}
+
+/// Lays out one scene, then tessellates the flat baseline and the elevation
+/// treatment many times, reporting triangle counts and per-frame CPU time.
+fn bench_scene(label: &str, tree: Entry) {
+    use egui::epaint::{ClippedShape, Primitive, TessellationOptions, Tessellator};
+    use std::time::Instant;
+
+    let root = Node::from_entry(&tree);
+    let viewport = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1280.0, 760.0));
+    let mut blocks: Vec<BenchBlock> = Vec::new();
+    collect_bench_blocks(&root, viewport.shrink(BLOCK_PAD), 0, &mut blocks);
+
+    let cards = blocks
+        .iter()
+        .filter(|b| b.rect.width() >= MIN_CARD_SIDE && b.rect.height() >= MIN_CARD_SIDE)
+        .count();
+    let flat = blocks.len() - cards;
+
+    let baseline = build_baseline_shapes(&blocks, viewport);
+    let elevated = build_elevated_shapes(&blocks, viewport);
+
+    let tessellate = |shapes: &[ClippedShape]| -> (usize, Vec<f64>) {
+        let iters = 200;
+        let mut tris = 0usize;
+        let mut times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let input = shapes.to_vec();
+            let mut tess = Tessellator::new(1.0, TessellationOptions::default(), [1, 1], vec![]);
+            let t0 = Instant::now();
+            let prims = tess.tessellate_shapes(input);
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            tris = prims
+                .iter()
+                .map(|p| match &p.primitive {
+                    Primitive::Mesh(m) => m.indices.len() / 3,
+                    _ => 0,
+                })
+                .sum();
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (tris, times)
+    };
+
+    let stat = |times: &[f64]| (times[times.len() / 2], times[0], times[times.len() - 1]);
+
+    let (base_tris, base_t) = tessellate(&baseline);
+    let (elev_tris, elev_t) = tessellate(&elevated);
+    let (bmed, bmin, bmax) = stat(&base_t);
+    let (emed, emin, emax) = stat(&elev_t);
+
+    println!("\n-- {label} --");
+    println!(
+        "layout: {} visible blocks ({cards} card-eligible, {flat} flat-fallback)",
+        blocks.len()
+    );
+    println!(
+        "baseline (flat fill + stroke):     {base_tris:>7} tris   {bmed:6.3} ms median  ({bmin:.3}..{bmax:.3})"
+    );
+    println!(
+        "elevated (shadow + gradient card): {elev_tris:>7} tris   {emed:6.3} ms median  ({emin:.3}..{emax:.3})"
+    );
+    println!(
+        "delta: {:.2}x triangles, {:.2}x median frame tessellation",
+        elev_tris as f64 / base_tris.max(1) as f64,
+        emed / bmed.max(f64::MIN_POSITIVE)
+    );
+}
+
+/// One laid-out block for the perf spike.
+struct BenchBlock {
+    rect: Rect,
+    is_dir: bool,
+    depth: usize,
+    nestable: bool,
+}
+
+/// Mirrors `draw_children`'s layout rules (sort, squarify, nest condition) to
+/// collect the set of blocks that would be painted, without touching a
+/// `Painter`. Spike-only.
+fn collect_bench_blocks(node: &Node, rect: Rect, depth: usize, out: &mut Vec<BenchBlock>) {
+    if node.children.is_empty() || rect.width() < 1.0 || rect.height() < 1.0 {
+        return;
+    }
+    let mut order: Vec<usize> = (0..node.children.len()).collect();
+    order.sort_by(|&a, &b| node.children[b].size.cmp(&node.children[a].size));
+    let sizes: Vec<u64> = order.iter().map(|&i| node.children[i].size).collect();
+    let layout = treemap::squarify(
+        &sizes,
+        treemap::Rect::new(rect.left(), rect.top(), rect.width(), rect.height()),
+    );
+    for (k, &i) in order.iter().enumerate() {
+        let child = &node.children[i];
+        let r = layout[k];
+        if r.w < 2.0 || r.h < 2.0 {
+            continue;
+        }
+        let block = Rect::from_min_size(Pos2::new(r.x, r.y), Vec2::new(r.w, r.h)).shrink(0.5);
+        let nestable = child.is_dir
+            && depth < MAX_DEPTH
+            && block.area() > MIN_NEST_AREA
+            && block.width() > MIN_NEST_SIDE
+            && block.height() > MIN_NEST_SIDE + DIR_LABEL_H;
+        out.push(BenchBlock {
+            rect: block,
+            is_dir: child.is_dir,
+            depth,
+            nestable,
+        });
+        if nestable {
+            let inner = Rect::from_min_max(
+                block.left_top() + Vec2::new(BLOCK_PAD, DIR_LABEL_H),
+                block.right_bottom() - Vec2::new(BLOCK_PAD, BLOCK_PAD),
+            );
+            collect_bench_blocks(child, inner, depth + 1, out);
+        }
+    }
+}
+
+/// Today's flat rendering for every block: rect fill + hairline stroke.
+fn build_baseline_shapes(blocks: &[BenchBlock], clip: Rect) -> Vec<egui::epaint::ClippedShape> {
+    let mut out = Vec::new();
+    for b in blocks {
+        let color = theme::depth_shift(theme::base_block_color("f.dll", b.is_dir), b.depth);
+        out.push(egui::epaint::ClippedShape {
+            clip_rect: clip,
+            shape: egui::Shape::rect_filled(b.rect, 2.0, color),
+        });
+        out.push(egui::epaint::ClippedShape {
+            clip_rect: clip,
+            shape: egui::Shape::rect_stroke(
+                b.rect,
+                2.0,
+                Stroke::new(1.0, theme::BLOCK_BORDER),
+                StrokeKind::Inside,
+            ),
+        });
+    }
+    out
+}
+
+/// The soft-elevation rendering, mirroring the planned `draw_children`: cards
+/// get shadow + gradient, trays get a recessed body + header, sub-threshold
+/// blocks fall back to flat.
+fn build_elevated_shapes(blocks: &[BenchBlock], clip: Rect) -> Vec<egui::epaint::ClippedShape> {
+    let mut out = Vec::new();
+    let mut push = |shape: egui::Shape| {
+        out.push(egui::epaint::ClippedShape {
+            clip_rect: clip,
+            shape,
+        })
+    };
+    for b in blocks {
+        let base = theme::depth_shift(theme::base_block_color("f.dll", b.is_dir), b.depth);
+        let card = b.rect.width() >= MIN_CARD_SIDE && b.rect.height() >= MIN_CARD_SIDE;
+        if !card {
+            push(egui::Shape::rect_filled(b.rect, 0.0, base));
+            push(egui::Shape::rect_stroke(
+                b.rect,
+                0.0,
+                Stroke::new(1.0, theme::BLOCK_BORDER),
+                StrokeKind::Inside,
+            ));
+        } else if b.is_dir && b.nestable {
+            push(egui::Shape::rect_filled(
+                b.rect,
+                theme::TRAY_CORNER_RADIUS,
+                theme::TRAY_FILL,
+            ));
+            let header = Rect::from_min_max(
+                b.rect.left_top(),
+                Pos2::new(b.rect.right(), b.rect.top() + DIR_LABEL_H),
+            );
+            push(egui::Shape::rect_filled(
+                header,
+                theme::TRAY_CORNER_RADIUS,
+                theme::tray_header_color("dir", b.depth),
+            ));
+            let inset = Rect::from_min_max(
+                Pos2::new(b.rect.left(), b.rect.top() + DIR_LABEL_H),
+                Pos2::new(b.rect.right(), b.rect.top() + DIR_LABEL_H + 6.0),
+            );
+            push(egui::Shape::mesh(gradient_mesh(
+                inset,
+                0.0,
+                theme::tray_inset_shadow(),
+                egui::Color32::TRANSPARENT,
+            )));
+        } else {
+            push(theme::card_shadow().as_shape(b.rect, theme::CARD_CORNER_RADIUS).into());
+            let (top, bottom) = theme::gradient_stops(base);
+            push(egui::Shape::mesh(gradient_mesh(
+                b.rect,
+                theme::CARD_CORNER_RADIUS,
+                top,
+                bottom,
+            )));
+            push(egui::Shape::rect_stroke(
+                b.rect,
+                theme::CARD_CORNER_RADIUS,
+                Stroke::new(1.0, theme::BLOCK_BORDER),
+                StrokeKind::Inside,
+            ));
+        }
+    }
+    out
+}
+
+/// A synthetic tree shaped like the dense motivating screenshot, for the perf
+/// spike. Deterministic (no RNG): sizes vary by index. Spike-only.
+fn synth_dense_tree() -> Entry {
+    fn file(name: String, size: u64) -> Entry {
+        Entry {
+            name,
+            path: PathBuf::from("bench"),
+            size,
+            is_dir: false,
+            children: Vec::new(),
+        }
+    }
+    fn dir(name: impl Into<String>, children: Vec<Entry>) -> Entry {
+        let size = children.iter().map(|c| c.size).sum();
+        Entry {
+            name: name.into(),
+            path: PathBuf::from("bench"),
+            size,
+            is_dir: true,
+            children,
+        }
+    }
+
+    // A big system dir dominated by hundreds of small DLLs (the dense mosaic).
+    let system32 = dir(
+        "System32",
+        (0..240)
+            .map(|i| file(format!("mod{i}.dll"), 40_000 + (i as u64 % 32) * 90_000))
+            .chain((0..60).map(|i| file(format!("drv{i}.sys"), 20_000 + (i as u64 % 16) * 30_000)))
+            .collect(),
+    );
+    // A few large installers.
+    let installers = dir(
+        "Installers",
+        (0..14)
+            .map(|i| file(format!("setup{i}.exe"), 200_000_000 + (i as u64) * 90_000_000))
+            .collect(),
+    );
+    // A dense ~30-file mosaic of similar mid-size files.
+    let downloads = dir(
+        "Downloads",
+        (0..30)
+            .map(|i| file(format!("clip{i}.mp4"), 6_000_000 + (i as u64 % 5) * 1_000_000))
+            .chain((0..8).map(|i| file(format!("iso{i}.iso"), 700_000_000 + (i as u64) * 30_000_000)))
+            .collect(),
+    );
+    // Nested app dirs (depth) with mixed small files.
+    let program_files = dir(
+        "Program Files",
+        (0..6)
+            .map(|a| {
+                dir(
+                    format!("App{a}"),
+                    (0..3)
+                        .map(|s| {
+                            dir(
+                                format!("sub{s}"),
+                                (0..24)
+                                    .map(|i| {
+                                        file(
+                                            format!("res{i}.bin"),
+                                            80_000 + (i as u64 % 10) * 120_000,
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    );
+
+    let mut loose: Vec<Entry> = (0..8)
+        .map(|i| file(format!("archive{i}.zip"), 1_200_000_000 + (i as u64) * 200_000_000))
+        .collect();
+    loose.extend([
+        dir("Windows", vec![system32]),
+        installers,
+        downloads,
+        program_files,
+    ]);
+    dir("C:\\", loose)
+}
+
+/// A single directory of ~400 near-equal mid-size files: squarify tiles them
+/// into a grid of ~49px blocks, all above the card threshold. The worst case
+/// for elevation cost (almost no flat fallback). Spike-only.
+fn synth_all_cards_tree() -> Entry {
+    let children: Vec<Entry> = (0..400)
+        .map(|i| Entry {
+            name: format!("file{i}.dat"),
+            path: PathBuf::from("bench"),
+            size: 1_000_000 + (i as u64 % 7) * 40_000,
+            is_dir: false,
+            children: Vec::new(),
+        })
+        .collect();
+    let size = children.iter().map(|c| c.size).sum();
+    Entry {
+        name: "Mosaic".to_string(),
+        path: PathBuf::from("bench"),
+        size,
+        is_dir: true,
+        children,
     }
 }
 

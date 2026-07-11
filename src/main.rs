@@ -14,6 +14,15 @@ fn main() -> eframe::Result<()> {
     // moment (after completion / mid-scan / drilled into the largest
     // directory), and exits.
     let args: Vec<String> = std::env::args().collect();
+
+    // Hidden dev flag: `bytewhiffer --debug-perf` runs the headless
+    // soft-elevation tessellation spike (flat baseline vs shadow+gradient on a
+    // synthetic dense tree) and exits without opening a window.
+    if args.get(1).map(String::as_str) == Some("--debug-perf") {
+        app::run_perf_bench();
+        return Ok(());
+    }
+
     let shot_mode = |flag: &str| match flag {
         "--debug-screenshot" => Some(app::DebugShotMode::Final),
         "--debug-screenshot-live" => Some(app::DebugShotMode::Live),
