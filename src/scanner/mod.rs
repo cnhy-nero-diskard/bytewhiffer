@@ -1,9 +1,14 @@
-//! Recursively scans a directory tree and builds an [`Entry`] tree annotated
-//! with disk usage (in bytes) at every node. This module has no GUI
-//! dependencies so it can be exercised with plain `cargo test`.
+//! The [`Entry`] tree type, the [`ScanEngine`] trait every scanning backend
+//! implements, and the shared progress/cancellation/event types engines use
+//! to report on an in-flight scan. This module has no GUI dependencies so it
+//! can be exercised with plain `cargo test`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
+
+pub mod walker;
 
 /// A single file or directory discovered during a scan.
 ///
@@ -34,227 +39,147 @@ impl Entry {
     }
 
     /// Number of direct children.
+    #[allow(dead_code)] // exercised by tests; kept as tree-inspection API
     pub fn child_count(&self) -> usize {
         self.children.len()
     }
 }
 
-/// Shared, lock-free counters a caller can poll from another thread to show
-/// "N files / X GB scanned so far" while a scan is in flight.
+/// Whether a given engine can scan a given target. Anything other than
+/// [`Availability::Available`] tells the orchestration layer to fall back to
+/// another engine rather than start a scan that cannot succeed.
+// Only `Available` is constructed while the walker is the sole engine; the
+// other variants are the contract the v2 MFT engine reports through.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Availability {
+    /// The engine can scan this target right now.
+    Available,
+    /// The engine could scan this target, but only with elevated privileges
+    /// (e.g. raw NTFS volume access needs admin rights).
+    RequiresElevation,
+    /// The target's filesystem is one this engine cannot read (e.g. an MFT
+    /// reader pointed at a FAT32 or network volume).
+    UnsupportedFilesystem,
+    /// The engine does not apply to this kind of target at all.
+    NotApplicable,
+}
+
+/// Why an engine produced no result at all. This is deliberately distinct
+/// from individual unreadable entries *within* a scan, which are skipped
+/// silently and simply absent from the resulting tree: a `ScanError` means
+/// the caller should fall back to another engine or surface a real failure,
+/// not treat the outcome as "scanned, found nothing."
+#[derive(Debug)]
+pub enum ScanError {
+    /// The engine cannot run against this target (mirrors a non-`Available`
+    /// capability check). Unconstructed until an engine that can actually
+    /// be unavailable (the v2 MFT reader) exists.
+    #[allow(dead_code)]
+    Unavailable(Availability),
+    /// The scan root itself could not be read.
+    RootUnreadable(std::io::Error),
+}
+
+/// Shared, lock-free progress state a caller can poll from another thread to
+/// show "N files / X GB scanned so far" while a scan is in flight. Counters
+/// only ever increase during a scan; `complete` flips once, when the engine
+/// returns, so pollers have a final "no longer in flight" state to observe.
 #[derive(Default)]
 pub struct ScanProgress {
     pub files_scanned: AtomicU64,
     pub bytes_scanned: AtomicU64,
+    complete: AtomicBool,
 }
 
-/// Recursively scans `root`, returning a tree of [`Entry`] with computed
-/// sizes. Pass a shared [`AtomicBool`] as `cancel` if you want to be able to
-/// abort a long-running scan from another thread (set it to `true`); the
-/// scan will stop descending soon after and return whatever partial tree it
-/// had built. `progress`, if given, is updated as files are discovered so a
-/// caller can display live counters.
-pub fn scan(root: &Path, cancel: &AtomicBool, progress: Option<&ScanProgress>) -> Entry {
-    let name = root
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.to_string_lossy().into_owned());
-
-    let mut entry = scan_dir(root, name, cancel, progress);
-    entry.sort_children_recursive();
-    entry
-}
-
-fn scan_dir(path: &Path, name: String, cancel: &AtomicBool, progress: Option<&ScanProgress>) -> Entry {
-    let mut children = Vec::new();
-    let mut total: u64 = 0;
-
-    if !cancel.load(Ordering::Relaxed) {
-        if let Ok(read_dir) = std::fs::read_dir(path) {
-            for entry_result in read_dir {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let Ok(dir_entry) = entry_result else {
-                    continue;
-                };
-
-                // `file_type()` reflects the entry itself and does not
-                // follow symlinks/junctions, unlike `metadata()` on some
-                // platforms. Skipping symlinks avoids double-counting and
-                // infinite loops on cyclic junctions.
-                let Ok(file_type) = dir_entry.file_type() else {
-                    continue;
-                };
-                if file_type.is_symlink() {
-                    continue;
-                }
-
-                let child_name = dir_entry.file_name().to_string_lossy().into_owned();
-                let child_path = dir_entry.path();
-
-                if file_type.is_dir() {
-                    let child = scan_dir(&child_path, child_name, cancel, progress);
-                    total += child.size;
-                    children.push(child);
-                } else {
-                    let size = dir_entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    total += size;
-                    if let Some(p) = progress {
-                        p.files_scanned.fetch_add(1, Ordering::Relaxed);
-                        p.bytes_scanned.fetch_add(size, Ordering::Relaxed);
-                    }
-                    children.push(Entry {
-                        name: child_name,
-                        path: child_path,
-                        size,
-                        is_dir: false,
-                        children: Vec::new(),
-                    });
-                }
-            }
-        }
+impl ScanProgress {
+    pub fn mark_complete(&self) {
+        self.complete.store(true, Ordering::Relaxed);
     }
 
-    Entry {
-        name,
-        path: path.to_path_buf(),
-        size: total,
-        is_dir: true,
-        children,
+    pub fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Relaxed)
     }
 }
 
-/// Formats a byte count the way SpaceSniffer-style tools do: a small number
-/// of significant digits and the largest unit that keeps the value >= 1.
-pub fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
+/// A live-discovery notification an engine may emit while scanning, letting
+/// the UI grow its treemap before the final tree is available.
+#[derive(Debug, Clone)]
+pub enum ScanEvent {
+    Discovered {
+        path: PathBuf,
+        size: u64,
+        is_dir: bool,
+    },
+}
+
+/// Everything an engine needs to communicate with the rest of the app while
+/// a scan runs: cooperative cancellation, pollable progress, and an
+/// *optional, best-effort* event sink for live discovery.
+///
+/// The event sink is best-effort by contract: the walker emits an event per
+/// discovered entry as it goes, but an engine that structurally cannot
+/// stream (a future MFT reader does one linear pass over the raw `$MFT`,
+/// then reconstructs the tree bottom-up in memory) may emit late, coarsely,
+/// or not at all. Callers get smooth live fill-in when the engine can offer
+/// it, and must not depend on it; the authoritative result is always the
+/// final `Entry` tree returned by [`ScanEngine::scan`].
+pub struct ScanContext {
+    pub cancel: Arc<AtomicBool>,
+    pub progress: Arc<ScanProgress>,
+    pub events: Option<Sender<ScanEvent>>,
+}
+
+impl ScanContext {
+    pub fn new() -> Self {
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(ScanProgress::default()),
+            events: None,
+        }
     }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
+
+    pub fn with_events(mut self, sender: Sender<ScanEvent>) -> Self {
+        self.events = Some(sender);
+        self
+    }
+
+    /// Sends a discovery event if a sink is attached, ignoring a
+    /// disconnected receiver (the UI hanging up is not the scan's problem).
+    pub(crate) fn emit(&self, event: ScanEvent) {
+        if let Some(sender) = &self.events {
+            let _ = sender.send(event);
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-
-    /// Minimal RAII temp-directory helper so tests don't need an external
-    /// crate: creates a uniquely-named directory under the OS temp dir and
-    /// removes it (and everything inside it) when dropped.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "space_sniffer_test_{}_{nanos}_{n}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).unwrap();
-            TempDir(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
+impl Default for ScanContext {
+    fn default() -> Self {
+        Self::new()
     }
+}
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+/// A scanning backend. The parallel directory walker implements this today;
+/// a v2 NTFS `$MFT` reader will implement it later, and the UI orchestration
+/// layer drives whichever engine it holds only through this interface.
+pub trait ScanEngine: Send + Sync {
+    /// Short human-readable engine name, for status display.
+    fn name(&self) -> &'static str;
 
-    /// Builds a small throwaway directory tree under the OS temp dir:
-    /// root/
-    ///   a.txt          (100 bytes)
-    ///   sub/
-    ///     b.txt        (50 bytes)
-    ///     empty_dir/
-    fn make_fixture() -> TempDir {
-        let dir = TempDir::new();
-        fs::write(dir.path().join("a.txt"), vec![0u8; 100]).unwrap();
-        let sub = dir.path().join("sub");
-        fs::create_dir(&sub).unwrap();
-        fs::write(sub.join("b.txt"), vec![0u8; 50]).unwrap();
-        fs::create_dir(sub.join("empty_dir")).unwrap();
-        dir
-    }
+    /// Whether this engine can scan `target`. Callers should check this
+    /// before [`ScanEngine::scan`] and fall back to another engine on
+    /// anything other than [`Availability::Available`].
+    fn is_available(&self, target: &Path) -> Availability;
 
-    #[test]
-    fn computes_recursive_sizes() {
-        let dir = make_fixture();
-        let cancel = AtomicBool::new(false);
-        let tree = scan(dir.path(), &cancel, None);
-
-        assert!(tree.is_dir);
-        assert_eq!(tree.size, 150);
-        assert_eq!(tree.child_count(), 2); // a.txt + sub/
-
-        let sub = tree
-            .children
-            .iter()
-            .find(|e| e.name == "sub")
-            .expect("sub dir present");
-        assert_eq!(sub.size, 50);
-        assert_eq!(sub.child_count(), 2); // b.txt + empty_dir/
-    }
-
-    #[test]
-    fn children_sorted_largest_first() {
-        let dir = make_fixture();
-        let cancel = AtomicBool::new(false);
-        let tree = scan(dir.path(), &cancel, None);
-
-        // a.txt (100 bytes) should sort before sub/ (50 bytes).
-        assert_eq!(tree.children[0].name, "a.txt");
-        assert_eq!(tree.children[1].name, "sub");
-    }
-
-    #[test]
-    fn progress_counters_track_files_and_bytes() {
-        let dir = make_fixture();
-        let cancel = AtomicBool::new(false);
-        let progress = ScanProgress::default();
-        let _tree = scan(dir.path(), &cancel, Some(&progress));
-
-        assert_eq!(progress.files_scanned.load(Ordering::Relaxed), 2);
-        assert_eq!(progress.bytes_scanned.load(Ordering::Relaxed), 150);
-    }
-
-    #[test]
-    fn cancel_stops_the_scan_early() {
-        let dir = make_fixture();
-        let cancel = AtomicBool::new(true); // already cancelled
-        let tree = scan(dir.path(), &cancel, None);
-
-        // With cancel already set, scan_dir should not even read the top
-        // directory's entries.
-        assert_eq!(tree.size, 0);
-        assert_eq!(tree.child_count(), 0);
-    }
-
-    #[test]
-    fn format_size_uses_sensible_units() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(999), "999 B");
-        assert_eq!(format_size(1536), "1.5 KB");
-        assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
-        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
-    }
+    /// Scans `target`, returning its completed [`Entry`] tree with children
+    /// sorted largest-first. Individual unreadable entries are skipped and
+    /// simply absent from the tree; an `Err` means the engine could not
+    /// produce a result at all. Implementations must honor `ctx.cancel`
+    /// (returning the partial tree built so far), keep `ctx.progress`
+    /// monotonically increasing, and call `mark_complete` before returning.
+    fn scan(&self, target: &Path, ctx: &ScanContext) -> Result<Entry, ScanError>;
 }

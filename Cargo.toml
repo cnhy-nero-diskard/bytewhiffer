@@ -1,0 +1,20 @@
+[package]
+name = "bytewhiffer"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, modern-looking disk space treemap visualizer"
+license = "MIT"
+
+[dependencies]
+eframe = "0.35"
+rayon = "1.10"
+rfd = "0.17"
+open = "5.3"
+trash = "5.2"
+# Already in eframe's dependency tree; used directly only by the hidden
+# --debug-screenshot flag that captures a frame for headless verification.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
