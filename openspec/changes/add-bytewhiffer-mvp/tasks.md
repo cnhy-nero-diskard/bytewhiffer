@@ -94,15 +94,12 @@
 - [x] 5.5 Implement breadcrumb / back control reflecting the navigation state
       from Task 4.4 *(drilled-in breadcrumb rendering verified via
       screenshot: `registry › src` with accent on the current crumb)*
-- [ ] **[WSLg checkpoint]** 5.6 Interactively verify hit-testing, hover,
+- [x] **[WSLg checkpoint]** 5.6 Interactively verify hit-testing, hover,
       click-to-drill, and breadcrumb navigation under WSLg — this exercises
       the overview doc's named render-interactivity risk (§7) directly
-      *(partially evidenced: hover/hit-testing verified with a real pointer,
-      drilled-in state verified via the debug-screenshot `drill` mode;
-      real mouse click-to-drill and context-menu still need human hands —
-      run `cargo run` and click around. As of 2026-07-11 a native Windows
-      build also exists at `target\release\bytewhiffer.exe`, so this pass can
-      be done on either side)*
+      *(confirmed 2026-07-11 via `cargo run` under WSLg: real mouse
+      click-to-drill, breadcrumb back-out, hover, and the right-click
+      context menu all behave as specified)*
 
 ## 6. File actions
 
@@ -157,11 +154,10 @@
 - [x] 8.1 Run the full `cargo test` suite (scanner + treemap unit tests)
       *(23 passing: walker/trait 9, treemap 8, theme 5, util 1; build is
       warning-free)*
-- [ ] 8.2 Full interactive pass under WSLg: scan a real directory tree, watch
+- [x] 8.2 Full interactive pass under WSLg: scan a real directory tree, watch
       it live-fill, drill in/out, hover, and confirm theming reads as
-      intended *(scan/live-fill/hover/drilled-state/theming all evidenced by
-      the three debug screenshots; the remaining human part is the same as
-      5.6 — real clicks)*
+      intended *(confirmed 2026-07-11 alongside 5.6 — same `cargo run`
+      session)*
 - [x] **[Windows checkpoint]** 8.3 Build/run the Windows target build at
       least once end-to-end (scan, navigate, all three actions) on a real
       Windows session before considering the MVP done
