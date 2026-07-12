@@ -35,10 +35,6 @@ const MIN_CARD_SIDE: f32 = 22.0;
 /// Gap inset applied to a raised card so its neighbours' drop shadows show
 /// through. Flat-fallback blocks below `MIN_CARD_SIDE` skip this (no gap).
 const CARD_GAP: f32 = 1.5;
-/// Padding of a directory tray's recessed well around the child cards it
-/// holds, so a rim of the dark tray body (and its inset top shadow) frames
-/// the floating children.
-const TRAY_PAD: f32 = 3.0;
 
 /// UI-side mirror of the scan tree. Built incrementally from `ScanEvent`s
 /// while a scan runs (so the map fills in live), then swapped wholesale for
@@ -874,6 +870,23 @@ impl eframe::App for BytewhifferApp {
     }
 }
 
+/// Walks down through a run of consecutive directories that each have
+/// exactly one child which is itself a directory, joining their names into a
+/// chain and returning the first directory that actually branches (zero
+/// children, more than one child, or whose only child is a file) — the
+/// "effective" node whose frame and contents get drawn. A directory with
+/// more than one child never advances past itself, so an ordinary branching
+/// directory returns a single-name chain unchanged.
+fn collapse_chain(start: &Node) -> (Vec<&str>, &Node) {
+    let mut names = vec![start.name.as_str()];
+    let mut node = start;
+    while node.children.len() == 1 && node.children[0].is_dir {
+        node = &node.children[0];
+        names.push(node.name.as_str());
+    }
+    (names, node)
+}
+
 /// Recursively draws `node`'s children into `rect`, collecting hit-test rects
 /// along the way. Children are laid out largest-first by the squarified
 /// algorithm. Blocks big enough to read (≥ `MIN_CARD_SIDE`) render as raised
@@ -925,10 +938,9 @@ fn draw_children(
         };
         let block = raw.shrink(shrink);
 
-        let base = theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
-        // A directory renders as a tray (header + recessed well) only when
+        // A directory renders as a frame (header + bordered well) only when
         // it will actually nest children into that well; a header over an
-        // empty recessed body — which happened whenever a dir cleared the
+        // empty bordered body — which happened whenever a dir cleared the
         // header-height bar but not the stricter nesting-area/side gate —
         // reads as a hole, not a directory. Below that bar it's just a plain
         // labeled card, like a file.
@@ -939,101 +951,126 @@ fn draw_children(
         let tray = child.is_dir && card_eligible && would_nest;
 
         if tray {
-            draw_tray_shell(painter, block, &child.name, depth);
-        } else if card_eligible {
-            paint_card(painter, block, base);
+            // Consecutive single-child directories (e.g. a Steam library's
+            // `SteamLibrary/steamapps/common`) collapse into one combined
+            // header instead of stacking a full-width bar per level; the
+            // frame is drawn around the first directory that actually
+            // branches, using its name for the frame's identity color.
+            let (chain, effective) = collapse_chain(child);
+            let label = chain.join(" / ");
+            draw_tray_shell(painter, block, &label, &effective.name, depth);
+
+            let chain_len = chain.len();
+            for name in chain {
+                trail.push(name.to_string());
+            }
+            hits.push(HitRect {
+                rect: block,
+                trail: trail.clone(),
+                fs_path: effective.path.clone(),
+                is_dir: true,
+                size: effective.size,
+            });
+
+            // Children pack flush against the frame's border line — depth
+            // advances once for the whole collapsed chain, not once per
+            // absorbed level, so elevation tracks visual containers shown
+            // rather than raw filesystem depth.
+            let inset = theme::DIR_FRAME_BORDER_WIDTH;
+            let inner = Rect::from_min_max(
+                Pos2::new(block.left() + inset, block.top() + DIR_LABEL_H + inset),
+                Pos2::new(block.right() - inset, block.bottom() - inset),
+            );
+            draw_children(painter, effective, inner, depth + 1, trail, hits);
+
+            for _ in 0..chain_len {
+                trail.pop();
+            }
         } else {
-            // Flat fallback: identical to the pre-elevation rendering, except
-            // a near-black 1px border on a block only a few pixels wide would
-            // swallow the fill entirely — at that scale the border reads as
-            // a solid dark hole rather than an outline, so skip it and let
-            // the fill color carry the tile.
-            painter.rect_filled(block, 0.0, base);
-            if block.width() >= 4.0 && block.height() >= 4.0 {
-                painter.rect_stroke(
-                    block,
-                    0.0,
-                    Stroke::new(1.0, theme::BLOCK_BORDER),
-                    StrokeKind::Inside,
+            let base = theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
+            if card_eligible {
+                paint_card(painter, block, base);
+            } else {
+                // Flat fallback: identical to the pre-elevation rendering, except
+                // a near-black 1px border on a block only a few pixels wide would
+                // swallow the fill entirely — at that scale the border reads as
+                // a solid dark hole rather than an outline, so skip it and let
+                // the fill color carry the tile.
+                painter.rect_filled(block, 0.0, base);
+                if block.width() >= 4.0 && block.height() >= 4.0 {
+                    painter.rect_stroke(
+                        block,
+                        0.0,
+                        Stroke::new(1.0, theme::BLOCK_BORDER),
+                        StrokeKind::Inside,
+                    );
+                }
+            }
+
+            trail.push(child.name.clone());
+            hits.push(HitRect {
+                rect: block,
+                trail: trail.clone(),
+                fs_path: child.path.clone(),
+                is_dir: child.is_dir,
+                size: child.size,
+            });
+
+            // Corner label when there's room. Threshold is lower than a full
+            // label's natural width on purpose: clipped text ("app-releas...")
+            // still identifies the block, which beats an anonymous color patch.
+            let label_fits = block.width() > 30.0 && block.height() > DIR_LABEL_H + 2.0;
+            if label_fits {
+                let label_painter = painter.with_clip_rect(block);
+                label_painter.text(
+                    block.left_top() + Vec2::new(6.0, 3.0),
+                    Align2::LEFT_TOP,
+                    &child.name,
+                    FontId::proportional(11.0),
+                    theme::TEXT,
                 );
             }
+
+            trail.pop();
         }
-
-        trail.push(child.name.clone());
-        hits.push(HitRect {
-            rect: block,
-            trail: trail.clone(),
-            fs_path: child.path.clone(),
-            is_dir: child.is_dir,
-            size: child.size,
-        });
-
-        // Trays carry their name in the header strip; cards/flat blocks get a
-        // corner label when there's room. Threshold is lower than a full
-        // label's natural width on purpose: clipped text ("app-releas...")
-        // still identifies the block, which beats an anonymous color patch.
-        let label_fits = !tray && block.width() > 30.0 && block.height() > DIR_LABEL_H + 2.0;
-        if label_fits {
-            let label_painter = painter.with_clip_rect(block);
-            label_painter.text(
-                block.left_top() + Vec2::new(6.0, 3.0),
-                Align2::LEFT_TOP,
-                &child.name,
-                FontId::proportional(11.0),
-                theme::TEXT,
-            );
-        }
-
-        // `tray` already implies `would_nest`, so a tray always has
-        // somewhere to recurse into.
-        if tray {
-            // Children float within the recessed well, inset by the tray rim.
-            let inner = Rect::from_min_max(
-                Pos2::new(block.left() + TRAY_PAD, block.top() + DIR_LABEL_H + TRAY_PAD),
-                Pos2::new(block.right() - TRAY_PAD, block.bottom() - TRAY_PAD),
-            );
-            draw_children(painter, child, inner, depth + 1, trail, hits);
-        }
-
-        trail.pop();
     }
 }
 
-/// Draws a directory's recessed-tray shell: a dark well, a header strip
-/// carrying the name, and a short inset shadow under the header so the well
-/// reads as carved below the surface. Children (raised cards) are drawn
-/// afterward, on top, appearing to float within it.
-fn draw_tray_shell(painter: &egui::Painter, block: Rect, name: &str, depth: usize) {
-    painter.rect_filled(block, theme::TRAY_CORNER_RADIUS, theme::TRAY_FILL);
+/// Draws a directory's frame: a bordered well tinted with a faint hash-of-
+/// name hue, and a header strip carrying `label` (a single name, or a
+/// collapsed chain's joined path). `color_name` is the effective (terminal)
+/// node's own name — the frame's identity color always comes from the actual
+/// container being drawn, not from any collapsed intermediate level. Children
+/// (raised cards) are drawn afterward, on top, packed flush against the
+/// border.
+fn draw_tray_shell(painter: &egui::Painter, block: Rect, label: &str, color_name: &str, depth: usize) {
+    let border = theme::dir_frame_border_color(color_name, depth);
+    let fill = theme::dir_frame_fill_color(border);
+    painter.rect_filled(block, theme::TRAY_CORNER_RADIUS, fill);
+    painter.rect_stroke(
+        block,
+        theme::TRAY_CORNER_RADIUS,
+        Stroke::new(theme::DIR_FRAME_BORDER_WIDTH, border),
+        StrokeKind::Inside,
+    );
 
     let header = Rect::from_min_max(
         block.left_top(),
         Pos2::new(block.right(), block.top() + DIR_LABEL_H),
     );
-    painter.rect_filled(header, theme::TRAY_CORNER_RADIUS, theme::tray_header_color(name, depth));
+    painter.rect_filled(
+        header,
+        theme::TRAY_CORNER_RADIUS,
+        theme::tray_header_color(color_name, depth),
+    );
     let label_painter = painter.with_clip_rect(header);
     label_painter.text(
         header.left_top() + Vec2::new(6.0, 2.0),
         Align2::LEFT_TOP,
-        name,
+        label,
         FontId::proportional(11.0),
         theme::TEXT,
     );
-
-    // Inset shadow: a short dark→transparent fade just below the header,
-    // spanning the well, drawn before the children so it frames their top.
-    let inset = Rect::from_min_max(
-        Pos2::new(block.left() + TRAY_PAD, block.top() + DIR_LABEL_H),
-        Pos2::new(block.right() - TRAY_PAD, block.top() + DIR_LABEL_H + TRAY_PAD + 4.0),
-    );
-    if inset.height() > 1.0 && inset.width() > 1.0 {
-        painter.add(egui::Shape::mesh(gradient_mesh(
-            inset,
-            0.0,
-            theme::tray_inset_shadow(),
-            egui::Color32::TRANSPARENT,
-        )));
-    }
 }
 
 /// Builds a rounded rectangle filled with a vertical top→bottom colour
@@ -1296,9 +1333,10 @@ fn collect_bench_blocks(node: &Node, rect: Rect, depth: usize, out: &mut Vec<Ben
             nestable,
         });
         if nestable {
+            let inset = theme::DIR_FRAME_BORDER_WIDTH;
             let inner = Rect::from_min_max(
-                block.left_top() + Vec2::new(BLOCK_PAD, DIR_LABEL_H),
-                block.right_bottom() - Vec2::new(BLOCK_PAD, BLOCK_PAD),
+                block.left_top() + Vec2::new(inset, DIR_LABEL_H + inset),
+                block.right_bottom() - Vec2::new(inset, inset),
             );
             collect_bench_blocks(child, inner, depth + 1, out);
         }
@@ -1350,10 +1388,14 @@ fn build_elevated_shapes(blocks: &[BenchBlock], clip: Rect) -> Vec<egui::epaint:
                 StrokeKind::Inside,
             ));
         } else if b.is_dir && b.nestable {
-            push(egui::Shape::rect_filled(
+            let border = theme::dir_frame_border_color("dir", b.depth);
+            let fill = theme::dir_frame_fill_color(border);
+            push(egui::Shape::rect_filled(b.rect, theme::TRAY_CORNER_RADIUS, fill));
+            push(egui::Shape::rect_stroke(
                 b.rect,
                 theme::TRAY_CORNER_RADIUS,
-                theme::TRAY_FILL,
+                Stroke::new(theme::DIR_FRAME_BORDER_WIDTH, border),
+                StrokeKind::Inside,
             ));
             let header = Rect::from_min_max(
                 b.rect.left_top(),
@@ -1364,16 +1406,6 @@ fn build_elevated_shapes(blocks: &[BenchBlock], clip: Rect) -> Vec<egui::epaint:
                 theme::TRAY_CORNER_RADIUS,
                 theme::tray_header_color("dir", b.depth),
             ));
-            let inset = Rect::from_min_max(
-                Pos2::new(b.rect.left(), b.rect.top() + DIR_LABEL_H),
-                Pos2::new(b.rect.right(), b.rect.top() + DIR_LABEL_H + 6.0),
-            );
-            push(egui::Shape::mesh(gradient_mesh(
-                inset,
-                0.0,
-                theme::tray_inset_shadow(),
-                egui::Color32::TRANSPARENT,
-            )));
         } else {
             push(theme::card_shadow().as_shape(b.rect, theme::CARD_CORNER_RADIUS).into());
             let (top, bottom) = theme::gradient_stops(base);

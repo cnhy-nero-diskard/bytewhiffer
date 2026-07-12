@@ -31,14 +31,21 @@ pub const CHROME_BASE: Color32 = Color32::from_rgb(0x1b, 0x22, 0x2d);
 pub const BLOCK_SATURATION: f32 = 0.42;
 pub const BLOCK_VALUE: f32 = 0.46;
 
-/// Directories are deliberately *not* hue-coded: a muted slate so the
-/// hue-coded files inside them carry the color signal.
-const DIR_HUE: f32 = 0.60; // blue-slate
-const DIR_SATURATION: f32 = 0.28;
-// Kept below BLOCK_VALUE so directories still read as duller than files, but
-// not so low that a small dir tile (bordered in near-black BLOCK_BORDER)
-// blends into BG and reads as a hole in the mosaic.
-const DIR_VALUE: f32 = 0.40;
+/// Saturation/value band for a directory's own hash-derived identity color
+/// (frame border + faint fill tint, small-card fallback). Distinct from and
+/// well below `BLOCK_SATURATION`/`BLOCK_VALUE` so directory identity never
+/// competes with vivid file colors, while still giving sibling directories
+/// a legible, per-name-distinct hue.
+const DIR_FRAME_SATURATION: f32 = 0.30;
+const DIR_FRAME_VALUE: f32 = 0.60;
+
+/// Stroke width for a directory's frame border — also used as the inset
+/// applied when packing its children flush against that border.
+pub const DIR_FRAME_BORDER_WIDTH: f32 = 1.5;
+
+/// How far a directory frame's border color is lerped toward `BG` to make
+/// its faint fill tint — a whisper of the border hue, not a competing fill.
+const DIR_FRAME_TINT_TOWARD_BG: f32 = 0.88;
 
 /// Per-level lightness lift that communicates nesting depth. Subtle on
 /// purpose; capped so deep trees don't wash out to white. Retained as a
@@ -73,15 +80,6 @@ const SHADOW_BLUR: u8 = 7;
 const SHADOW_SPREAD: u8 = 0;
 const SHADOW_ALPHA: u8 = 110;
 
-/// A directory renders as a shallow recessed tray. Its body is darker than
-/// the surrounding surface so raised child cards (and their shadows) read as
-/// floating above it.
-pub const TRAY_FILL: Color32 = Color32::from_rgb(0x08, 0x0b, 0x10);
-/// Colour of the short inner top shadow that sells the "recessed" look.
-pub fn tray_inset_shadow() -> Color32 {
-    Color32::from_black_alpha(90)
-}
-
 /// Top/bottom gradient stops for a card of the given base colour: lighter at
 /// the top, darker at the bottom. Hue is untouched — this shades the fixed
 /// per-extension colour, it does not pick a new one.
@@ -101,11 +99,24 @@ pub fn card_shadow() -> Shadow {
     }
 }
 
-/// The header strip colour for a directory tray: its muted-slate base,
-/// lifted by depth like any block, then brightened a touch so the name
-/// strip reads as the tray's "label bar" above the darker body.
+/// The header strip colour for a directory's frame: its hash-derived
+/// identity color, lifted by depth like any block, then brightened a touch
+/// so the name strip reads as the frame's "label bar".
 pub fn tray_header_color(name: &str, depth: usize) -> Color32 {
-    depth_shift(base_block_color(name, true), depth).lerp_to_gamma(Color32::WHITE, 0.06)
+    dir_frame_border_color(name, depth).lerp_to_gamma(Color32::WHITE, 0.06)
+}
+
+/// Border-stroke color for a directory's frame: its hash-derived identity
+/// color (see `base_block_color`), depth-shifted like any block.
+pub fn dir_frame_border_color(name: &str, depth: usize) -> Color32 {
+    depth_shift(base_block_color(name, true), depth)
+}
+
+/// Faint fill tint for a directory's frame body, derived from its (already
+/// depth-shifted) border color by lerping most of the way toward the
+/// background — replaces the old flat recessed-tray fill.
+pub fn dir_frame_fill_color(border: Color32) -> Color32 {
+    border.lerp_to_gamma(BG, DIR_FRAME_TINT_TOWARD_BG)
 }
 
 /// Installs the dark theme on the egui context. Called once at startup.
@@ -134,11 +145,13 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
-/// Base block color for a treemap entry, before any depth shift: muted
-/// slate for directories, hash-derived hue for files.
+/// Base block color for a treemap entry, before any depth shift:
+/// hash-derived hue for both — files in the vivid file band, directories in
+/// the muted directory band — so sibling directories carry a legible,
+/// distinct identity color without competing with file hues.
 pub fn base_block_color(name: &str, is_dir: bool) -> Color32 {
     if is_dir {
-        hsv(DIR_HUE, DIR_SATURATION, DIR_VALUE)
+        color_for_directory(name)
     } else {
         color_for_extension(extension_of(name))
     }
@@ -151,6 +164,16 @@ pub fn color_for_extension(ext: &str) -> Color32 {
     let hash = fnv1a(ext.to_ascii_lowercase().as_bytes());
     let hue = (hash % 360) as f32 / 360.0;
     hsv(hue, BLOCK_SATURATION, BLOCK_VALUE)
+}
+
+/// Deterministic color for a directory: FNV-1a hash of its lowercased name
+/// picks the hue (same mechanism as `color_for_extension`), pinned to the
+/// muted directory band. The same name always maps to the same color;
+/// different names differ in hue, making sibling directories distinguishable.
+fn color_for_directory(name: &str) -> Color32 {
+    let hash = fnv1a(name.to_ascii_lowercase().as_bytes());
+    let hue = (hash % 360) as f32 / 360.0;
+    hsv(hue, DIR_FRAME_SATURATION, DIR_FRAME_VALUE)
 }
 
 /// Lightens a base color by nesting depth so structure reads without
@@ -220,6 +243,55 @@ mod tests {
                 hsva.v
             );
         }
+    }
+
+    #[test]
+    fn same_directory_name_same_frame_color() {
+        assert_eq!(base_block_color("Games", true), base_block_color("Games", true));
+        assert_eq!(base_block_color("GAMES", true), base_block_color("games", true));
+    }
+
+    #[test]
+    fn different_directory_names_differ_in_hue() {
+        let a = base_block_color("Games", true);
+        let b = base_block_color("Documents", true);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn directory_frame_colors_stay_inside_the_muted_band() {
+        for name in ["Games", "Documents", "SteamLibrary", "node_modules", ""] {
+            let hsva = Hsva::from(base_block_color(name, true));
+            assert!(
+                (hsva.s - DIR_FRAME_SATURATION).abs() < 0.05,
+                "{name}: saturation {} escaped the muted directory band",
+                hsva.s
+            );
+            assert!(
+                (hsva.v - DIR_FRAME_VALUE).abs() < 0.05,
+                "{name}: value {} escaped the muted directory band",
+                hsva.v
+            );
+        }
+    }
+
+    #[test]
+    fn directory_band_is_distinct_from_file_band() {
+        assert!(
+            (DIR_FRAME_SATURATION - BLOCK_SATURATION).abs() > 0.05
+                || (DIR_FRAME_VALUE - BLOCK_VALUE).abs() > 0.05,
+            "the muted directory band must read as visually distinct from the file band"
+        );
+    }
+
+    #[test]
+    fn dir_frame_border_color_depth_shifts_monotonically_and_caps() {
+        let base = dir_frame_border_color("dir", 0);
+        let d1 = dir_frame_border_color("dir", 1);
+        let d3 = dir_frame_border_color("dir", 3);
+        assert!(d1.r() >= base.r() && d1.g() >= base.g() && d1.b() >= base.b());
+        assert!(d3.r() >= d1.r());
+        assert_eq!(dir_frame_border_color("dir", 50), dir_frame_border_color("dir", 100));
     }
 
     #[test]
