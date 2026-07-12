@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
@@ -15,7 +15,7 @@ use crate::scanner::{
 };
 use crate::theme;
 use crate::treemap;
-use crate::util::format_size;
+use crate::util::{format_duration, format_size};
 
 /// Stop nesting once a block is this small; below it nothing inside would
 /// be readable or clickable anyway.
@@ -222,6 +222,16 @@ impl DebugShot {
     }
 }
 
+/// Snapshot of a finished scan's counters, copied out of `ScanProgress`
+/// immediately before `ActiveScan` (and its atomics) are dropped, so the
+/// bottom status bar can keep displaying them indefinitely afterward.
+struct ScanSummary {
+    files: u64,
+    dirs: u64,
+    bytes: u64,
+    elapsed: Duration,
+}
+
 #[derive(Default)]
 pub struct BytewhifferApp {
     path_input: String,
@@ -232,8 +242,25 @@ pub struct BytewhifferApp {
     /// Block the open context menu refers to (trail from root, fs path).
     context_target: Option<(Vec<String>, PathBuf, bool)>,
     hovered_path: Option<PathBuf>,
+    hovered_size: Option<u64>,
     error: Option<String>,
     debug_shot: Option<DebugShot>,
+    /// Root path of the most recently started scan, kept after the scan
+    /// completes (or fails) so Rescan can re-run it without retyping.
+    last_scanned_path: Option<PathBuf>,
+    /// Name of the engine that produced, or is producing, the current scan.
+    engine_name: Option<&'static str>,
+    scan_started_at: Option<Instant>,
+    /// Last (time, bytes) sample used to derive `scan_rate_bps`, refreshed
+    /// roughly once a second so the rate doesn't jitter between repaints.
+    rate_sample: Option<(Instant, u64)>,
+    scan_rate_bps: f64,
+    /// Running per-top-level-child byte totals, updated once per discovery
+    /// event so the largest child of the scan root can be tracked without
+    /// re-walking the live tree.
+    top_level_sizes: HashMap<String, u64>,
+    biggest_top_level: Option<(String, u64)>,
+    last_summary: Option<ScanSummary>,
 }
 
 impl BytewhifferApp {
@@ -263,6 +290,7 @@ impl BytewhifferApp {
             }
         }
 
+        let engine_name = engine.name();
         let (tx, rx) = mpsc::channel();
         let thread_ctx = ScanContext::new().with_events(tx);
         // The UI keeps its own handles to the same cancel/progress state,
@@ -281,6 +309,14 @@ impl BytewhifferApp {
         self.root = Some(Node::new(root_name, target.clone(), 0, true));
         self.focus.clear();
         self.hovered_path = None;
+        self.hovered_size = None;
+        self.last_scanned_path = Some(target.clone());
+        self.engine_name = Some(engine_name);
+        self.scan_started_at = Some(Instant::now());
+        self.rate_sample = None;
+        self.scan_rate_bps = 0.0;
+        self.top_level_sizes.clear();
+        self.biggest_top_level = None;
 
         let handle = std::thread::spawn(move || engine.scan(&target, &thread_ctx));
         self.scan = Some(ActiveScan {
@@ -298,7 +334,35 @@ impl BytewhifferApp {
             for event in scan.events.try_iter() {
                 let ScanEvent::Discovered { path, size, is_dir } = event;
                 if let Ok(rel) = path.strip_prefix(&base) {
+                    if let Some(first) = rel.components().next() {
+                        let top_name = first.as_os_str().to_string_lossy().into_owned();
+                        let entry = self.top_level_sizes.entry(top_name.clone()).or_insert(0);
+                        *entry += size;
+                        let total = *entry;
+                        let is_new_max = self
+                            .biggest_top_level
+                            .as_ref()
+                            .map_or(true, |(_, max)| total > *max);
+                        if is_new_max {
+                            self.biggest_top_level = Some((top_name, total));
+                        }
+                    }
                     root.insert(rel, size, is_dir);
+                }
+            }
+        }
+
+        // Refresh the scan-rate sample roughly once a second so the number
+        // doesn't jitter between the ~100ms repaints a streaming scan drives.
+        let now = Instant::now();
+        let bytes_now = scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed);
+        match self.rate_sample {
+            None => self.rate_sample = Some((now, bytes_now)),
+            Some((t, b)) => {
+                let dt = now.duration_since(t).as_secs_f64();
+                if dt >= 1.0 {
+                    self.scan_rate_bps = bytes_now.saturating_sub(b) as f64 / dt;
+                    self.rate_sample = Some((now, bytes_now));
                 }
             }
         }
@@ -308,6 +372,15 @@ impl BytewhifferApp {
         // the join right after it can only block momentarily.
         let finished = scan.ctx.progress.is_complete();
         if finished {
+            self.last_summary = Some(ScanSummary {
+                files: scan.ctx.progress.files_scanned.load(Ordering::Relaxed),
+                dirs: scan.ctx.progress.dirs_scanned.load(Ordering::Relaxed),
+                bytes: scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed),
+                elapsed: self
+                    .scan_started_at
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default(),
+            });
             if let Some(handle) = scan.handle.take() {
                 match handle.join() {
                     Ok(Ok(entry)) => {
@@ -372,23 +445,105 @@ impl BytewhifferApp {
                 self.start_scan(PathBuf::from(self.path_input.trim()));
             }
 
+            if chrome_button(ui, "Rescan", self.last_scanned_path.is_some()).clicked() {
+                if let Some(path) = self.last_scanned_path.clone() {
+                    self.start_scan(path);
+                }
+            }
+
             if let Some(scan) = &self.scan {
                 if chrome_button(ui, "Cancel", true).clicked() {
                     scan.ctx.cancel.store(true, Ordering::Relaxed);
                 }
                 ui.spinner();
-                let files = scan.ctx.progress.files_scanned.load(Ordering::Relaxed);
-                let bytes = scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// In-flight scan HUD: an indeterminate/pulsing progress bar plus every
+    /// *live* number the scan can report. Shown only while `self.scan` is
+    /// `Some`; owns these figures exclusively so the bottom status bar can
+    /// stay quiet about them until the scan completes.
+    fn scan_hud(&mut self, ui: &mut egui::Ui) {
+        let Some(scan) = &self.scan else { return };
+        let files = scan.ctx.progress.files_scanned.load(Ordering::Relaxed);
+        let dirs = scan.ctx.progress.dirs_scanned.load(Ordering::Relaxed);
+        let bytes = scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed);
+        let elapsed = self
+            .scan_started_at
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        let rate = self.scan_rate_bps;
+        let biggest = self.biggest_top_level.clone();
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+
+            // Motion only — no fill level tied to completion, since the
+            // parallel walker has no way to know a scan's total size ahead
+            // of time. `0.5` is an arbitrary constant, not a fraction of
+            // anything real.
+            ui.add(
+                egui::ProgressBar::new(0.5)
+                    .animate(true)
+                    .desired_width(110.0)
+                    .desired_height(6.0)
+                    .fill(theme::ACCENT),
+            );
+
+            ui.colored_label(
+                theme::TEXT_SUBTLE,
+                format!("{files} files · {dirs} dirs · {}", format_size(bytes)),
+            );
+            ui.colored_label(theme::TEXT_SUBTLE, format!("{}/s", format_size(rate as u64)));
+            ui.colored_label(theme::TEXT_SUBTLE, format_duration(elapsed));
+            if let Some((name, size)) = biggest {
                 ui.colored_label(
                     theme::TEXT_SUBTLE,
-                    format!("{files} files · {} scanned", format_size(bytes)),
-                );
-            } else if let Some(root) = &self.root {
-                ui.colored_label(
-                    theme::TEXT_SUBTLE,
-                    format!("{} total", format_size(root.size)),
+                    format!("Largest so far: {name} ({})", format_size(size)),
                 );
             }
+        });
+    }
+
+    /// Persistent bottom status bar: a hover readout on the left (mirrors
+    /// the block tooltip but never disappears), and on the right a scan
+    /// summary that survives past scan completion plus the engine name.
+    /// Goes quiet about live counts while a scan is running, since the HUD
+    /// above already owns those.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+
+            match (&self.hovered_path, self.hovered_size) {
+                (Some(path), Some(size)) => {
+                    ui.colored_label(theme::TEXT, path.display().to_string());
+                    ui.colored_label(theme::TEXT_SUBTLE, format_size(size));
+                }
+                _ => {
+                    ui.colored_label(theme::TEXT_SUBTLE, "Hover a block to inspect");
+                }
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(name) = self.engine_name {
+                    ui.colored_label(theme::TEXT_SUBTLE, name);
+                }
+                if self.scan.is_some() {
+                    ui.colored_label(theme::TEXT_SUBTLE, "Scanning…");
+                } else if let Some(summary) = &self.last_summary {
+                    ui.colored_label(
+                        theme::TEXT_SUBTLE,
+                        format!(
+                            "{} files · {} dirs · {} · {}",
+                            summary.files,
+                            summary.dirs,
+                            format_size(summary.bytes),
+                            format_duration(summary.elapsed)
+                        ),
+                    );
+                }
+            });
         });
     }
 
@@ -426,6 +581,7 @@ impl BytewhifferApp {
         if let Some(f) = new_focus {
             self.focus = f;
             self.hovered_path = None;
+            self.hovered_size = None;
         }
     }
 
@@ -486,6 +642,7 @@ impl BytewhifferApp {
         let hovered = hover_pos.and_then(|pos| hits.iter().rev().find(|h| h.rect.contains(pos)));
 
         self.hovered_path = hovered.map(|h| h.fs_path.clone());
+        self.hovered_size = hovered.map(|h| h.size);
         if let Some(hit) = hovered {
             painter.rect_stroke(
                 hit.rect,
@@ -693,8 +850,18 @@ impl eframe::App for BytewhifferApp {
             ui.add_space(4.0);
             self.toolbar(ui);
             ui.add_space(2.0);
+            if self.scan.is_some() {
+                self.scan_hud(ui);
+                ui.add_space(2.0);
+            }
             self.breadcrumb(ui);
             ui.add_space(4.0);
+        });
+
+        egui::Panel::bottom(egui::Id::new("status_bar")).show(ui, |ui| {
+            ui.add_space(2.0);
+            self.status_bar(ui);
+            ui.add_space(2.0);
         });
 
         egui::CentralPanel::default_margins()

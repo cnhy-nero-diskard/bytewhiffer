@@ -88,6 +88,7 @@ pub enum ScanError {
 #[derive(Default)]
 pub struct ScanProgress {
     pub files_scanned: AtomicU64,
+    pub dirs_scanned: AtomicU64,
     pub bytes_scanned: AtomicU64,
     complete: AtomicBool,
 }

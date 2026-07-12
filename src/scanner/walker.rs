@@ -77,6 +77,7 @@ fn scan_dir(path: &Path, name: String, ctx: &ScanContext) -> Entry {
                 let child_path = dir_entry.path();
 
                 if file_type.is_dir() {
+                    ctx.progress.dirs_scanned.fetch_add(1, Ordering::Relaxed);
                     ctx.emit(ScanEvent::Discovered {
                         path: child_path.clone(),
                         size: 0,
@@ -214,13 +215,15 @@ mod tests {
     }
 
     #[test]
-    fn progress_counters_track_files_and_bytes() {
+    fn progress_counters_track_files_bytes_and_dirs() {
         let dir = make_fixture();
         let ctx = ScanContext::new();
         let _tree = WalkerEngine.scan(dir.path(), &ctx).unwrap();
 
         assert_eq!(ctx.progress.files_scanned.load(Ordering::Relaxed), 2);
         assert_eq!(ctx.progress.bytes_scanned.load(Ordering::Relaxed), 150);
+        // sub/ and sub/empty_dir/ — the fixture's two subdirectories.
+        assert_eq!(ctx.progress.dirs_scanned.load(Ordering::Relaxed), 2);
     }
 
     #[test]
