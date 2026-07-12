@@ -907,33 +907,56 @@ fn draw_children(
     for (k, &i) in order.iter().enumerate() {
         let child = &node.children[i];
         let r = layout[k];
-        if r.w < 2.0 || r.h < 2.0 {
+        if r.w <= 0.0 || r.h <= 0.0 {
             continue;
         }
         let raw = Rect::from_min_size(Pos2::new(r.x, r.y), Vec2::new(r.w, r.h));
         // Card-eligible blocks earn a gap so neighbours' shadows show; flat
-        // fallbacks keep today's tight 0.5px seam.
+        // fallbacks keep today's tight 0.5px seam. Sub-pixel slivers skip the
+        // shrink entirely so it can't invert to a negative size and vanish —
+        // a hairline is a truer picture of the tree than a silent hole.
         let card_eligible = raw.width() >= MIN_CARD_SIDE && raw.height() >= MIN_CARD_SIDE;
-        let block = raw.shrink(if card_eligible { CARD_GAP } else { 0.5 });
+        let shrink = if card_eligible {
+            CARD_GAP
+        } else if raw.width() > 1.0 && raw.height() > 1.0 {
+            0.5
+        } else {
+            0.0
+        };
+        let block = raw.shrink(shrink);
 
         let base = theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
-        // A directory renders as a tray (header + recessed well) whenever
-        // there's room for its title bar; otherwise it's a plain card.
-        let tray = child.is_dir && card_eligible && block.height() >= DIR_LABEL_H + 8.0;
+        // A directory renders as a tray (header + recessed well) only when
+        // it will actually nest children into that well; a header over an
+        // empty recessed body — which happened whenever a dir cleared the
+        // header-height bar but not the stricter nesting-area/side gate —
+        // reads as a hole, not a directory. Below that bar it's just a plain
+        // labeled card, like a file.
+        let would_nest = depth < MAX_DEPTH
+            && block.area() > MIN_NEST_AREA
+            && block.width() > MIN_NEST_SIDE
+            && block.height() > MIN_NEST_SIDE + DIR_LABEL_H;
+        let tray = child.is_dir && card_eligible && would_nest;
 
         if tray {
             draw_tray_shell(painter, block, &child.name, depth);
         } else if card_eligible {
             paint_card(painter, block, base);
         } else {
-            // Flat fallback: identical to the pre-elevation rendering.
+            // Flat fallback: identical to the pre-elevation rendering, except
+            // a near-black 1px border on a block only a few pixels wide would
+            // swallow the fill entirely — at that scale the border reads as
+            // a solid dark hole rather than an outline, so skip it and let
+            // the fill color carry the tile.
             painter.rect_filled(block, 0.0, base);
-            painter.rect_stroke(
-                block,
-                0.0,
-                Stroke::new(1.0, theme::BLOCK_BORDER),
-                StrokeKind::Inside,
-            );
+            if block.width() >= 4.0 && block.height() >= 4.0 {
+                painter.rect_stroke(
+                    block,
+                    0.0,
+                    Stroke::new(1.0, theme::BLOCK_BORDER),
+                    StrokeKind::Inside,
+                );
+            }
         }
 
         trail.push(child.name.clone());
@@ -946,8 +969,10 @@ fn draw_children(
         });
 
         // Trays carry their name in the header strip; cards/flat blocks get a
-        // corner label when there's room.
-        let label_fits = !tray && block.width() > 48.0 && block.height() > DIR_LABEL_H + 2.0;
+        // corner label when there's room. Threshold is lower than a full
+        // label's natural width on purpose: clipped text ("app-releas...")
+        // still identifies the block, which beats an anonymous color patch.
+        let label_fits = !tray && block.width() > 30.0 && block.height() > DIR_LABEL_H + 2.0;
         if label_fits {
             let label_painter = painter.with_clip_rect(block);
             label_painter.text(
@@ -959,12 +984,9 @@ fn draw_children(
             );
         }
 
-        let nestable = tray
-            && depth < MAX_DEPTH
-            && block.area() > MIN_NEST_AREA
-            && block.width() > MIN_NEST_SIDE
-            && block.height() > MIN_NEST_SIDE + DIR_LABEL_H;
-        if nestable {
+        // `tray` already implies `would_nest`, so a tray always has
+        // somewhere to recurse into.
+        if tray {
             // Children float within the recessed well, inset by the tray rim.
             let inner = Rect::from_min_max(
                 Pos2::new(block.left() + TRAY_PAD, block.top() + DIR_LABEL_H + TRAY_PAD),

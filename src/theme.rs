@@ -34,8 +34,11 @@ pub const BLOCK_VALUE: f32 = 0.46;
 /// Directories are deliberately *not* hue-coded: a muted slate so the
 /// hue-coded files inside them carry the color signal.
 const DIR_HUE: f32 = 0.60; // blue-slate
-const DIR_SATURATION: f32 = 0.25;
-const DIR_VALUE: f32 = 0.30;
+const DIR_SATURATION: f32 = 0.28;
+// Kept below BLOCK_VALUE so directories still read as duller than files, but
+// not so low that a small dir tile (bordered in near-black BLOCK_BORDER)
+// blends into BG and reads as a hole in the mosaic.
+const DIR_VALUE: f32 = 0.40;
 
 /// Per-level lightness lift that communicates nesting depth. Subtle on
 /// purpose; capped so deep trees don't wash out to white. Retained as a
