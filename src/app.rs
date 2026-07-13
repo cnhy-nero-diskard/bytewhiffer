@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
+use crate::insights;
 use crate::scanner::{
     walker::WalkerEngine, Availability, Entry, ScanContext, ScanEngine, ScanError, ScanEvent,
 };
@@ -23,6 +24,8 @@ const MIN_NEST_AREA: f32 = 1200.0;
 const MIN_NEST_SIDE: f32 = 24.0;
 /// Hard depth cap as a backstop against pathological trees.
 const MAX_DEPTH: usize = 10;
+/// How many entries the biggest-files/folders leaderboard shows.
+const LEADERBOARD_N: usize = 15;
 /// Vertical space reserved for a directory's name strip when nesting into it.
 const DIR_LABEL_H: f32 = 16.0;
 const BLOCK_PAD: f32 = 2.0;
@@ -228,6 +231,17 @@ struct ScanSummary {
     elapsed: Duration,
 }
 
+/// The Insights drawer's computed analytics for one (focus, tree revision).
+/// Cached so the whole-subtree aggregations run once per change — not every
+/// frame (see the change's design doc) — and cloned cheaply for rendering.
+#[derive(Clone, Default)]
+struct InsightsData {
+    ext_totals: Vec<(String, u64)>,
+    leaderboard: Vec<insights::LeaderboardEntry>,
+    blizzard: Vec<insights::BlizzardEntry>,
+    junk: Vec<insights::JunkEntry>,
+}
+
 #[derive(Default)]
 pub struct BytewhifferApp {
     path_input: String,
@@ -257,6 +271,16 @@ pub struct BytewhifferApp {
     top_level_sizes: HashMap<String, u64>,
     biggest_top_level: Option<(String, u64)>,
     last_summary: Option<ScanSummary>,
+    /// Whether the left-side Insights drawer is open. Closed by default so
+    /// the treemap stays full-width until the user summons it.
+    insights_open: bool,
+    /// Bumped whenever `root` changes (scan start, live discovery, scan
+    /// completion, deletion) so the drawer can tell its cache is stale.
+    tree_rev: u64,
+    /// Cached drawer analytics plus the (focus, tree_rev) they describe;
+    /// recomputed only when that key changes.
+    insights_cache: Option<InsightsData>,
+    insights_key: Option<(Vec<String>, u64)>,
 }
 
 impl BytewhifferApp {
@@ -313,6 +337,7 @@ impl BytewhifferApp {
         self.scan_rate_bps = 0.0;
         self.top_level_sizes.clear();
         self.biggest_top_level = None;
+        self.tree_rev = self.tree_rev.wrapping_add(1);
 
         let handle = std::thread::spawn(move || engine.scan(&target, &thread_ctx));
         self.scan = Some(ActiveScan {
@@ -325,9 +350,11 @@ impl BytewhifferApp {
     fn drain_scan(&mut self) {
         let Some(scan) = &mut self.scan else { return };
 
+        let mut discovered_any = false;
         if let Some(root) = &mut self.root {
             let base = root.path.clone();
             for event in scan.events.try_iter() {
+                discovered_any = true;
                 let ScanEvent::Discovered { path, size, is_dir } = event;
                 if let Ok(rel) = path.strip_prefix(&base) {
                     if let Some(first) = rel.components().next() {
@@ -346,6 +373,10 @@ impl BytewhifferApp {
                     root.insert(rel, size, is_dir);
                 }
             }
+        }
+        // A live scan grows the tree; let the drawer recompute against it.
+        if discovered_any {
+            self.tree_rev = self.tree_rev.wrapping_add(1);
         }
 
         // Refresh the scan-rate sample roughly once a second so the number
@@ -404,6 +435,8 @@ impl BytewhifferApp {
                     }
                 }
             }
+            // The authoritative tree replaced the live one; recompute.
+            self.tree_rev = self.tree_rev.wrapping_add(1);
             self.scan = None;
         }
     }
@@ -445,6 +478,15 @@ impl BytewhifferApp {
                 if let Some(path) = self.last_scanned_path.clone() {
                     self.start_scan(path);
                 }
+            }
+
+            let insights_label = if self.insights_open {
+                "📊 Insights ◂"
+            } else {
+                "📊 Insights ▸"
+            };
+            if chrome_button(ui, insights_label, true).clicked() {
+                self.insights_open = !self.insights_open;
             }
 
             if let Some(scan) = &self.scan {
@@ -706,6 +748,7 @@ impl BytewhifferApp {
                     if let Some(root) = &mut self.root {
                         root.remove(&trail);
                     }
+                    self.tree_rev = self.tree_rev.wrapping_add(1);
                     // If the deleted directory was inside the focused path,
                     // fall back to its parent.
                     if self.focus.starts_with(&trail) {
@@ -717,6 +760,167 @@ impl BytewhifferApp {
                 }
             }
             ui.close();
+        }
+    }
+
+    /// Recomputes the drawer's analytics if the focus or the tree has
+    /// changed since they were last computed; a no-op otherwise. Keeps the
+    /// whole-subtree walks off the per-frame render path.
+    fn refresh_insights(&mut self) {
+        let key = (self.focus.clone(), self.tree_rev);
+        if self.insights_cache.is_some() && self.insights_key.as_ref() == Some(&key) {
+            return;
+        }
+        let data = {
+            let Some(root) = &self.root else {
+                self.insights_cache = None;
+                self.insights_key = Some(key);
+                return;
+            };
+            // Describe whatever the treemap is currently showing — the same
+            // node `treemap_panel` resolves via `root.find(&self.focus)`.
+            let focus_node = root.find(&self.focus).unwrap_or(root);
+            let view = to_insight(focus_node);
+            InsightsData {
+                ext_totals: view.extension_totals(),
+                leaderboard: view.leaderboard(LEADERBOARD_N),
+                blizzard: view.blizzard_flags(),
+                junk: view.junk_suggestions(),
+            }
+        };
+        self.insights_cache = Some(data);
+        self.insights_key = Some(key);
+    }
+
+    /// Renders the Insights drawer: an extension legend + size breakdown, a
+    /// biggest-items leaderboard, a small-file-blizzard flag list, and
+    /// known-junk suggestions — all describing the focused subtree. Clicking
+    /// a leaderboard/blizzard entry navigates the treemap; right-clicking a
+    /// junk entry opens the same Delete/Open/Reveal menu as a treemap block.
+    fn insights_panel(&mut self, ui: &mut egui::Ui) {
+        self.refresh_insights();
+
+        ui.add_space(4.0);
+        ui.heading("Insights");
+        ui.add_space(2.0);
+
+        // No scan has ever produced a tree: a neutral placeholder, mirroring
+        // the treemap's own "Pick a folder…" empty state.
+        let Some(data) = self.insights_cache.clone() else {
+            ui.colored_label(theme::TEXT_SUBTLE, "Run a scan to see insights here.");
+            return;
+        };
+
+        // Navigation/actions triggered this frame are staged and applied
+        // after rendering so the loops keep reading a stable focus base.
+        let base = self.focus.clone();
+        let mut new_focus: Option<Vec<String>> = None;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // --- File types: legend + size breakdown in one list. Each
+                // row's swatch is the exact color the treemap paints that
+                // extension, so the two can never drift apart. ---
+                insights_header(ui, "File types");
+                if data.ext_totals.is_empty() {
+                    insights_empty(ui, "No files in view.");
+                } else {
+                    for (ext, size) in &data.ext_totals {
+                        ui.horizontal(|ui| {
+                            swatch(ui, theme::color_for_extension(ext));
+                            let label = if ext.is_empty() {
+                                "(no extension)".to_owned()
+                            } else {
+                                format!(".{ext}")
+                            };
+                            ui.colored_label(theme::TEXT, label);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| ui.colored_label(theme::TEXT_SUBTLE, format_size(*size)),
+                            );
+                        });
+                    }
+                }
+                ui.add_space(10.0);
+
+                // --- Biggest items leaderboard. Clicking focuses the map on
+                // the entry (its parent, for a file). ---
+                insights_header(ui, "Biggest items");
+                if data.leaderboard.is_empty() {
+                    insights_empty(ui, "Nothing to rank yet.");
+                } else {
+                    for entry in &data.leaderboard {
+                        let icon = if entry.is_dir { "📁" } else { "📄" };
+                        let resp = ui
+                            .selectable_label(
+                                false,
+                                format!("{icon} {}  ·  {}", entry.name, format_size(entry.size)),
+                            )
+                            .on_hover_text(entry.path.display().to_string());
+                        if resp.clicked() {
+                            new_focus = Some(focus_for(&base, &entry.trail, entry.is_dir));
+                        }
+                    }
+                }
+                ui.add_space(10.0);
+
+                // --- Small-file blizzard flags. Clicking focuses the dir. ---
+                insights_header(ui, "Small-file clutter");
+                if data.blizzard.is_empty() {
+                    insights_empty(ui, "No dense small-file folders.");
+                } else {
+                    for entry in &data.blizzard {
+                        let resp = ui.selectable_label(
+                            false,
+                            format!(
+                                "📁 {}  ·  {} items, {} avg",
+                                entry.name,
+                                entry.child_count,
+                                format_size(entry.avg_child_size)
+                            ),
+                        );
+                        if resp.clicked() {
+                            new_focus = Some(focus_for(&base, &entry.trail, true));
+                        }
+                    }
+                }
+                ui.add_space(10.0);
+
+                // --- Known-junk suggestions. Advisory only: right-clicking
+                // opens the same context menu a treemap block does; nothing
+                // is deleted merely by being listed here. ---
+                insights_header(ui, "Junk suggestions");
+                if data.junk.is_empty() {
+                    insights_empty(ui, "No known-junk matches.");
+                } else {
+                    ui.colored_label(theme::TEXT_SUBTLE, "Right-click for Open / Reveal / Delete.");
+                    for entry in &data.junk {
+                        let icon = if entry.is_dir { "📁" } else { "📄" };
+                        let resp = ui.selectable_label(
+                            false,
+                            format!(
+                                "{icon} {}  ·  {} · {}",
+                                entry.name,
+                                entry.category,
+                                format_size(entry.size)
+                            ),
+                        );
+                        if resp.secondary_clicked() {
+                            let mut trail = base.clone();
+                            trail.extend(entry.trail.iter().cloned());
+                            self.context_target =
+                                Some((trail, entry.path.clone(), entry.is_dir));
+                        }
+                        resp.context_menu(|ui| self.context_menu_contents(ui));
+                    }
+                }
+            });
+
+        if let Some(f) = new_focus {
+            self.focus = f;
+            self.hovered_path = None;
+            self.hovered_size = None;
         }
     }
 
@@ -860,6 +1064,17 @@ impl eframe::App for BytewhifferApp {
             ui.add_space(2.0);
         });
 
+        if self.insights_open {
+            egui::Panel::left(egui::Id::new("insights_drawer"))
+                .resizable(true)
+                .min_size(240.0)
+                .max_size(360.0)
+                .default_size(300.0)
+                .show(ui, |ui| {
+                    self.insights_panel(ui);
+                });
+        }
+
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ui, |ui| {
@@ -868,6 +1083,49 @@ impl eframe::App for BytewhifferApp {
 
         self.error_window(&ctx);
     }
+}
+
+/// Borrows a live-UI `Node` subtree into the egui-free insight view the
+/// `insights` module aggregates over. Cheap: a shallow walk that borrows
+/// names/paths rather than copying them.
+fn to_insight(node: &Node) -> insights::InsightNode<'_> {
+    insights::InsightNode {
+        name: &node.name,
+        path: &node.path,
+        size: node.size,
+        is_dir: node.is_dir,
+        children: node.children.iter().map(to_insight).collect(),
+    }
+}
+
+/// The absolute focus trail for a drawer entry: the current focus `base`
+/// plus the entry's relative `trail`. A file can't be focused, so it resolves
+/// to its parent directory (the view that shows the file), matching how
+/// click-to-drill only ever focuses directories.
+fn focus_for(base: &[String], trail: &[String], is_dir: bool) -> Vec<String> {
+    let mut f = base.to_vec();
+    let take = if is_dir { trail.len() } else { trail.len().saturating_sub(1) };
+    f.extend(trail[..take].iter().cloned());
+    f
+}
+
+/// A drawer section header.
+fn insights_header(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).strong().color(theme::TEXT));
+    ui.add_space(2.0);
+}
+
+/// A neutral per-section empty state, shown instead of an empty gap when a
+/// section has nothing to report for the focused subtree.
+fn insights_empty(ui: &mut egui::Ui, text: &str) {
+    ui.colored_label(theme::TEXT_SUBTLE, text);
+}
+
+/// A small color swatch for a legend/breakdown row, painted in the exact
+/// color the treemap assigns that extension.
+fn swatch(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::hover());
+    ui.painter().rect_filled(rect, 2.0, color);
 }
 
 /// Walks down through a run of consecutive directories that each have
