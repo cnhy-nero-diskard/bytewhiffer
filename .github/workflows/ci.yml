@@ -7,7 +7,33 @@ on:
     branches: [main]
 
 jobs:
+  gate:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - name: Check commit is a direct push to main or a verified PR merge
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          data=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}")
+          parents=$(echo "$data" | jq '.parents | length')
+          verified=$(echo "$data" | jq -r '.commit.verification.verified')
+          if [ "$parents" -le 1 ] || [ "$verified" = "true" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,6 +44,8 @@ jobs:
       - run: cargo test --release
 
   build:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
