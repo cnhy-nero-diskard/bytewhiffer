@@ -28,28 +28,85 @@ tagging, export, NTFS MFT "turbo mode" scanning).
 
 ## Building & running
 
+### Quick start
+
 ```sh
 cargo build --release
 cargo run --release
 ```
 
-## Project layout
+### Windows build with MinGW
+
+On Windows without MSVC Build Tools installed, use the GNU toolchain:
+
+```powershell
+$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:LOCALAPPDATA\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin;$env:PATH"
+cargo +stable-x86_64-pc-windows-gnu build --release
+```
+
+Output: `target/release/bytewhiffer.exe`
+
+**Note:** The release build is compiled with `windows_subsystem = "windows"`, so launching from PowerShell does not block the shell. Use `Start-Process -Wait` or poll for output.
+
+## Testing
+
+```sh
+cargo test                    # all tests (scanner, treemap, theme, util)
+cargo test <name>             # single test by name (substring match)
+```
+
+Tests run without a display and exercise the core logic in isolation.
+
+## Debug flags
+
+Hidden flags for headless verification and profiling:
+
+```sh
+bytewhiffer --debug-screenshot <out.png> <scan-path>
+bytewhiffer --debug-screenshot-live <out.png> <scan-path>
+bytewhiffer --debug-screenshot-drill <out.png> <scan-path>
+bytewhiffer --debug-perf
+```
+
+- `--debug-screenshot` — capture after scan completes
+- `--debug-screenshot-live` — capture mid-scan with partial map
+- `--debug-screenshot-drill` — capture drilled into the largest subdirectory
+- `--debug-perf` — headless tessellation benchmark (flat baseline vs soft-elevation); redirect stdout: `Start-Process bytewhiffer --debug-perf -RedirectStandardOutput perf.txt`
+
+## Architecture
+
+### Module layout
 
 ```
 src/
-  main.rs        — entry point, eframe::run_native setup
+  main.rs        — entry point, eframe::run_native setup, debug flag parsing
   app.rs         — eframe::App impl: UI state, panel layout, background-scan
-                   orchestration, navigation state
+                   orchestration, navigation
   scanner/
-    mod.rs       — Entry tree type, shared ScanEngine trait, progress counters
-    walker.rs    — parallel directory-walk scan engine
-  treemap.rs     — pure squarified-treemap layout algorithm, GUI-independent
-  theme.rs       — color palette + deterministic color-from-extension logic
-  util.rs        — byte-size formatting and small helpers
+    mod.rs       — Entry tree type, ScanEngine trait, ScanContext, progress counters
+    walker.rs    — parallel (rayon) directory-walk ScanEngine implementation
+  treemap.rs     — pure squarified-treemap layout algorithm (Bruls/Huizing/van Wijk 1999)
+  theme.rs       — color palette + deterministic hash-derived color-from-extension logic
+  util.rs        — byte-size formatting
 ```
 
-`scanner/` and `treemap.rs` are kept free of any `egui` dependency so they
-stay fully unit-testable without a display.
+`scanner/` and `treemap.rs` are deliberately free of any `egui` dependency, staying fully unit-testable without a display.
+
+### ScanEngine abstraction
+
+Every scanning backend implements the `ScanEngine` trait: `name()`, `is_available()`, and `scan()`. Currently only `WalkerEngine` (parallel `read_dir` recursion via rayon) exists, but the trait is designed for a v2 NTFS MFT-reading engine (requires elevation, local NTFS only). Scans run on a background thread. `ScanContext` carries a cancellation flag, atomic `ScanProgress` counters, and an optional `mpsc::Sender<ScanEvent>` for live discovery — the walker streams `ScanEvent::Discovered` per entry so the UI grows the map while scanning. The authoritative result is always the final `Entry` tree returned by `scan()`, never the event stream.
+
+### Two parallel tree types
+
+`scanner::Entry` is the engine's tree (final, authoritative, built after a scan completes). `app.rs::Node` is a separate UI-side tree with the same shape plus a `name -> index` map per node, built incrementally from `ScanEvent`s while scanning (so the map fills in live), then swapped wholesale via `Node::from_entry(&entry)` once the scan finishes. These are not unified — incremental insertion (`Node::insert`) and the index map are UI-only concerns.
+
+### Treemap layout
+
+`treemap::squarify` is pure geometry: sizes in, one `Rect` per size out, in order — no knowledge of egui, files, or units. `app.rs::draw_children` adapts: it sorts a `Node`'s children largest-first per frame, feeds sizes to `squarify`, zips rects back to children by index, and recurses into directories large enough on screen (see `MIN_NEST_AREA`/`MIN_NEST_SIDE`/`MAX_DEPTH` constants).
+
+### Theming
+
+Directories are fixed muted-slate (not hue-coded) so hue-coded files carry the signal. File colors come from an FNV-1a hash of the lowercased extension, mapped to hue, with fixed saturation/value (see `BLOCK_SATURATION`/`BLOCK_VALUE`) for a curated look. Nesting depth uses capped lightness lift (see `theme::depth_shift`), not new hues. Accent color (hover, breadcrumb, selection) is reserved and never reused.
 
 ## Development
 
