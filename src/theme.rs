@@ -73,12 +73,28 @@ pub const TRAY_CORNER_RADIUS: f32 = 5.0;
 const GRAD_LIGHTEN: f32 = 0.13;
 const GRAD_DARKEN: f32 = 0.16;
 
-/// Soft drop shadow cast by a raised card. Blurred (not hard-edged) per the
-/// design decision; kept small so the penumbra stays tight on small cards.
+/// Soft drop shadow cast by a raised treemap card. Blurred (not hard-edged)
+/// per the design decision; kept small so the penumbra stays tight on small
+/// cards. Tuned by eye against treemap-scale cards (tens–hundreds of px);
+/// chrome uses the tighter `CHROME_SHADOW_*` values below, not these — see
+/// `chrome_shadow` for why the two are kept separate.
 const SHADOW_OFFSET: [i8; 2] = [0, 2];
 const SHADOW_BLUR: u8 = 7;
 const SHADOW_SPREAD: u8 = 0;
 const SHADOW_ALPHA: u8 = 110;
+
+/// Drop shadow for chrome surfaces (toolbar buttons, path field, breadcrumb
+/// chips). A deliberately smaller, tighter version of the card shadow above:
+/// chrome elements are only ~26–34px tall, and the block-scale 7px blur / 2px
+/// offset has no room to fade gently at that size — it reads as a distinct,
+/// doubled rectangle rather than a subtle lift. Scaled down here so chrome
+/// gets the same elevation *language* as the treemap at its own scale (the
+/// theming spec's "scaled appropriately"). Retune alongside `SHADOW_*` above
+/// if the card look changes, so the two don't drift apart.
+const CHROME_SHADOW_OFFSET: [i8; 2] = [0, 1];
+const CHROME_SHADOW_BLUR: u8 = 3;
+const CHROME_SHADOW_SPREAD: u8 = 0;
+const CHROME_SHADOW_ALPHA: u8 = 90;
 
 /// Top/bottom gradient stops for a card of the given base colour: lighter at
 /// the top, darker at the bottom. Hue is untouched — this shades the fixed
@@ -89,13 +105,25 @@ pub fn gradient_stops(base: Color32) -> (Color32, Color32) {
     (top, bottom)
 }
 
-/// The soft drop shadow cast by a raised card.
+/// The soft drop shadow cast by a raised treemap card.
 pub fn card_shadow() -> Shadow {
     Shadow {
         offset: SHADOW_OFFSET,
         blur: SHADOW_BLUR,
         spread: SHADOW_SPREAD,
         color: Color32::from_black_alpha(SHADOW_ALPHA),
+    }
+}
+
+/// The tighter drop shadow cast by a raised chrome element, scaled to chrome's
+/// smaller element size so it reads as a subtle lift rather than a doubled
+/// shape (see `CHROME_SHADOW_*`).
+pub fn chrome_shadow() -> Shadow {
+    Shadow {
+        offset: CHROME_SHADOW_OFFSET,
+        blur: CHROME_SHADOW_BLUR,
+        spread: CHROME_SHADOW_SPREAD,
+        color: Color32::from_black_alpha(CHROME_SHADOW_ALPHA),
     }
 }
 
@@ -328,6 +356,25 @@ mod tests {
         assert!(
             card_shadow().blur > 0,
             "elevation uses a soft blurred shadow, not a hard-edged one"
+        );
+    }
+
+    #[test]
+    fn chrome_shadow_is_tighter_than_the_card_shadow() {
+        // Chrome elements are much smaller than treemap cards, so their shadow
+        // must be scaled down ("scaled appropriately", per the theming spec) or
+        // the block-scale blur reads as a doubled, offset rectangle. It stays a
+        // real (blurred, offset) shadow — just a smaller one.
+        let card = card_shadow();
+        let chrome = chrome_shadow();
+        assert!(chrome.blur > 0, "chrome still casts a soft shadow");
+        assert!(
+            chrome.blur < card.blur,
+            "chrome blur must be tighter than the card blur"
+        );
+        assert!(
+            chrome.offset[1] <= card.offset[1],
+            "chrome shadow must not sit lower than the card shadow"
         );
     }
 

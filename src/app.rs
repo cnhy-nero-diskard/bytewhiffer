@@ -16,7 +16,7 @@ use crate::scanner::{
 };
 use crate::theme;
 use crate::treemap;
-use crate::util::{format_duration, format_size};
+use crate::util::{elide_middle, format_duration, format_size};
 
 /// Stop nesting once a block is this small; below it nothing inside would
 /// be readable or clickable anyway.
@@ -38,6 +38,17 @@ const MIN_CARD_SIDE: f32 = 22.0;
 /// Gap inset applied to a raised card so its neighbours' drop shadows show
 /// through. Flat-fallback blocks below `MIN_CARD_SIDE` skip this (no gap).
 const CARD_GAP: f32 = 1.5;
+/// Character budget for the hover tooltip's path line before it is
+/// middle-elided (see `util::elide_middle`). Sized to a comfortable single
+/// line; the bottom status bar carries the full, unelided path.
+const TOOLTIP_MAX_CHARS: usize = 64;
+/// Once the focused subtree holds more than this many descendant entries, the
+/// treemap paints card-eligible blocks with a cheaper flat-rounded fill (no
+/// blurred shadow, no gradient mesh) for the whole frame, so hover/pointer
+/// tracking stays responsive on dense views. See `BytewhifferApp::render_dense`.
+/// Tuned against the `--debug-perf` spike; a global per-view switch (not
+/// per-block) so a view never mixes elevated and flat cards inconsistently.
+const DENSE_RENDER_THRESHOLD: usize = 1500;
 
 /// UI-side mirror of the scan tree. Built incrementally from `ScanEvent`s
 /// while a scan runs (so the map fills in live), then swapped wholesale for
@@ -128,6 +139,17 @@ impl Node {
             node = &node.children[*node.child_index.get(name)?];
         }
         Some(node)
+    }
+
+    /// Total entries in this node's subtree, excluding the node itself — every
+    /// descendant file and directory, at any depth. A stable, cheap density
+    /// proxy for the render-tier decision (see `BytewhifferApp::refresh_density`),
+    /// walked once per (focus, tree_rev) change rather than every frame.
+    fn descendant_count(&self) -> usize {
+        self.children
+            .iter()
+            .map(|c| 1 + c.descendant_count())
+            .sum()
     }
 
     /// Removes the node at `names`, subtracting its size from every
@@ -281,6 +303,12 @@ pub struct BytewhifferApp {
     /// recomputed only when that key changes.
     insights_cache: Option<InsightsData>,
     insights_key: Option<(Vec<String>, u64)>,
+    /// Cached "is the focused subtree dense enough for the cheap render tier?"
+    /// decision, plus the (focus, tree_rev) it describes — recomputed only when
+    /// that key changes, exactly like `insights_cache`. Keeps the descendant
+    /// count off the per-frame path so pointer/hover tracking stays responsive.
+    render_dense: bool,
+    density_key: Option<(Vec<String>, u64)>,
 }
 
 impl BytewhifferApp {
@@ -624,6 +652,13 @@ impl BytewhifferApp {
     }
 
     fn treemap_panel(&mut self, ui: &mut egui::Ui) {
+        // Decide the render tier before borrowing `root`: on a dense focused
+        // subtree, card-eligible blocks drop to a cheap flat-rounded fill for
+        // the whole frame so per-frame tessellation (and thus hover/pointer
+        // tracking) stays responsive. Cached, so this is a field read here.
+        self.refresh_density();
+        let dense = self.render_dense;
+
         let avail = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(avail, Sense::click());
         let painter = ui.painter_at(avail);
@@ -672,6 +707,7 @@ impl BytewhifferApp {
             0,
             &mut Vec::new(),
             &mut hits,
+            dense,
         );
 
         // Deepest block under the pointer wins: children are pushed after
@@ -695,7 +731,16 @@ impl BytewhifferApp {
                 egui::PopupAnchor::Pointer,
             )
             .show(|ui| {
-                ui.label(egui::RichText::new(hit.trail.join("/")).strong());
+                // Elide the middle of long trails and force a single line: with
+                // `PopupAnchor::Pointer` the popup gets squeezed against the
+                // viewport edge, and a raw slash-joined path (no spaces to break
+                // on) would otherwise hard-wrap into a one-glyph-per-line column.
+                // The full, unelided path still shows in the bottom status bar.
+                let trail = elide_middle(&hit.trail.join("/"), TOOLTIP_MAX_CHARS);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(trail).strong())
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
                 ui.colored_label(theme::TEXT_SUBTLE, format_size(hit.size));
             });
 
@@ -761,6 +806,26 @@ impl BytewhifferApp {
             }
             ui.close();
         }
+    }
+
+    /// Recomputes whether the focused subtree is dense enough to warrant the
+    /// cheap (flat-rounded) render tier, if the focus or tree changed since it
+    /// was last computed; a no-op otherwise. Mirrors `refresh_insights`: the
+    /// whole-subtree descendant count runs once per change, never per frame, so
+    /// a frame driven purely by pointer movement never pays for it.
+    fn refresh_density(&mut self) {
+        let key = (self.focus.clone(), self.tree_rev);
+        if self.density_key.as_ref() == Some(&key) {
+            return;
+        }
+        let count = self
+            .root
+            .as_ref()
+            .and_then(|root| root.find(&self.focus))
+            .map(|node| node.descendant_count())
+            .unwrap_or(0);
+        self.render_dense = count > DENSE_RENDER_THRESHOLD;
+        self.density_key = Some(key);
     }
 
     /// Recomputes the drawer's analytics if the focus or the tree has
@@ -1153,6 +1218,13 @@ fn collapse_chain(start: &Node) -> (Vec<&str>, &Node) {
 /// recessed tray (dark well + header strip) whose children float above it as
 /// cards. Everything below the threshold falls back to today's flat fill with
 /// no shadow/gradient/radius/gap, so dense clusters stay legible and cheap.
+///
+/// When `dense` is set (the focused subtree is large — see
+/// `BytewhifferApp::refresh_density`), card-eligible blocks keep their rounded
+/// silhouette but drop the blurred shadow and gradient mesh — the two costly
+/// tessellation steps — so a viewport packed with hundreds of cards stays cheap
+/// enough that hover/pointer tracking doesn't fall behind the cursor. Trays are
+/// already cheap (flat fill + stroke + header) and render the same either way.
 fn draw_children(
     painter: &egui::Painter,
     node: &Node,
@@ -1160,6 +1232,7 @@ fn draw_children(
     depth: usize,
     trail: &mut Vec<String>,
     hits: &mut Vec<HitRect>,
+    dense: bool,
 ) {
     if node.children.is_empty() || rect.width() < 1.0 || rect.height() < 1.0 {
         return;
@@ -1239,15 +1312,26 @@ fn draw_children(
                 Pos2::new(block.left() + inset, block.top() + DIR_LABEL_H + inset),
                 Pos2::new(block.right() - inset, block.bottom() - inset),
             );
-            draw_children(painter, effective, inner, depth + 1, trail, hits);
+            draw_children(painter, effective, inner, depth + 1, trail, hits, dense);
 
             for _ in 0..chain_len {
                 trail.pop();
             }
         } else {
             let base = theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
-            if card_eligible {
+            if card_eligible && !dense {
                 paint_card(painter, block, base);
+            } else if card_eligible {
+                // Dense tier: keep the rounded card silhouette but skip the
+                // blurred shadow and the gradient mesh — the two expensive
+                // tessellation steps — so a view packed with cards stays cheap.
+                painter.rect_filled(block, theme::CARD_CORNER_RADIUS, base);
+                painter.rect_stroke(
+                    block,
+                    theme::CARD_CORNER_RADIUS,
+                    Stroke::new(1.0, theme::BLOCK_BORDER),
+                    StrokeKind::Inside,
+                );
             } else {
                 // Flat fallback: identical to the pre-elevation rendering, except
                 // a near-black 1px border on a block only a few pixels wide would
@@ -1364,11 +1448,13 @@ fn gradient_mesh(rect: Rect, radius: f32, top: egui::Color32, bottom: egui::Colo
     mesh
 }
 
-/// Draws one raised card: soft drop shadow, gradient fill, and a hairline
-/// rounded outline for crispness. `base` is the (already depth-shifted) block
-/// colour.
-fn paint_card(painter: &egui::Painter, rect: Rect, base: egui::Color32) {
-    painter.add(theme::card_shadow().as_shape(rect, theme::CARD_CORNER_RADIUS));
+/// Draws one raised surface: `shadow` drop shadow, gradient fill, and a
+/// hairline rounded outline for crispness. `base` is the (already
+/// depth-shifted) fill colour. The shadow is a parameter so treemap cards and
+/// chrome can each pass a shadow scaled to their own element size while sharing
+/// the identical gradient/radius/outline treatment.
+fn paint_elevated(painter: &egui::Painter, rect: Rect, base: egui::Color32, shadow: egui::epaint::Shadow) {
+    painter.add(shadow.as_shape(rect, theme::CARD_CORNER_RADIUS));
     let (top, bottom) = theme::gradient_stops(base);
     painter.add(egui::Shape::mesh(gradient_mesh(
         rect,
@@ -1384,13 +1470,21 @@ fn paint_card(painter: &egui::Painter, rect: Rect, base: egui::Color32) {
     );
 }
 
+/// Draws one raised treemap card, using the block-scale drop shadow.
+fn paint_card(painter: &egui::Painter, rect: Rect, base: egui::Color32) {
+    paint_elevated(painter, rect, base, theme::card_shadow());
+}
+
 /// Paints a raised surface for a chrome element, honouring the same size
 /// floor as treemap blocks: elevated (shadow + gradient + rounded) at normal
 /// sizes, flat below `MIN_CARD_SIDE`. Chrome is unlikely to hit the floor in
-/// practice, but the rule is applied for consistency.
+/// practice, but the rule is applied for consistency. Uses the tighter
+/// `theme::chrome_shadow()` scaled to chrome's small element size, not the
+/// block-scale card shadow, so the shadow reads as a subtle lift rather than a
+/// doubled, offset rectangle at ~26–34px tall.
 fn paint_surface(painter: &egui::Painter, rect: Rect, base: egui::Color32) {
     if rect.width() >= MIN_CARD_SIDE && rect.height() >= MIN_CARD_SIDE {
-        paint_card(painter, rect, base);
+        paint_elevated(painter, rect, base, theme::chrome_shadow());
     } else {
         painter.rect_filled(rect, 0.0, base);
         painter.rect_stroke(
