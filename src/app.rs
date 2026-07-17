@@ -211,11 +211,44 @@ struct ActiveScan {
 /// abstract — the depth cap gives a uniform "top-level only" endpoint, the
 /// size scale gives continuous thinning at every slider position regardless of
 /// how deep the tree happens to be. See `BytewhifferApp::nest_gate`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct NestGate {
     max_depth: usize,
     min_side: f32,
     min_area: f32,
+}
+
+/// Resolves an `abstraction` slider value (0.0 detail .. 1.0 abstract) into a
+/// `NestGate`. Combines two levers that both tighten toward the abstract end:
+///
+/// - **Depth cap** — full `MAX_DEPTH` at detail, dropping to a floor of 1 at
+///   abstract, where only the focused node's direct children nest a single
+///   level and everything deeper collapses. This is what makes "fully
+///   abstract" reliably mean "only the top-level blocks show interior",
+///   *uniformly* across every branch regardless of pixel size. The mapping is
+///   concave (`(1 - a)^2`) because real trees rarely render deeper than ~5-6
+///   levels, so a linear 10→1 ramp would leave the slider's left half doing
+///   nothing; squaring front-loads the drop.
+/// - **Size scale** — multiplies `MIN_NEST_SIDE`/`MIN_NEST_AREA` by up to
+///   `1.0 + ABSTRACTION_SIDE_GAIN`. The depth cap only bites once a branch is
+///   deeper than the cap, so on a shallow tree it can do nothing until near
+///   the abstract end; the size scale fills that gap by thinning small/medium
+///   blocks continuously at every slider position.
+///
+/// At `abstraction == 0.0` both reduce to today's exact constants, so the
+/// detail end preserves prior behavior. A free function (not a method) so it
+/// can be unit-tested and reused by the `--debug-perf` bench without needing a
+/// live `BytewhifferApp`.
+fn resolve_nest_gate(abstraction: f32) -> NestGate {
+    let a = abstraction.clamp(0.0, 1.0);
+    let depth_span = (MAX_DEPTH - 1) as f32;
+    let max_depth = (1.0 + depth_span * (1.0 - a).powi(2)).round() as usize;
+    let side_scale = 1.0 + a * ABSTRACTION_SIDE_GAIN;
+    NestGate {
+        max_depth,
+        min_side: MIN_NEST_SIDE * side_scale,
+        min_area: MIN_NEST_AREA * side_scale * side_scale,
+    }
 }
 
 /// One rendered treemap block that can be hovered/clicked, with the trail
@@ -932,36 +965,10 @@ impl BytewhifferApp {
         self.density_key = Some(key);
     }
 
-    /// The render posture's resolved nesting gate for this frame. Combines two
-    /// levers that both tighten as `abstraction` rises from detail (0.0) to
-    /// abstract (1.0):
-    ///
-    /// - **Depth cap** — full `MAX_DEPTH` at detail, dropping to a floor of 1
-    ///   at abstract, where only the focused node's direct children nest a
-    ///   single level and everything deeper collapses. This is what makes
-    ///   "fully abstract" reliably mean "only the top-level blocks show
-    ///   interior", *uniformly* across every branch regardless of pixel size.
-    ///   The mapping is concave (`(1 - a)^2`) because real trees rarely render
-    ///   deeper than ~5-6 levels, so a linear 10→1 ramp would leave the
-    ///   slider's left half doing nothing; squaring front-loads the drop.
-    /// - **Size scale** — multiplies `MIN_NEST_SIDE`/`MIN_NEST_AREA` by up to
-    ///   `1.0 + ABSTRACTION_SIDE_GAIN`. The depth cap only bites once a branch
-    ///   is deeper than the cap, so on a shallow tree it can do nothing until
-    ///   near the abstract end; the size scale fills that gap by thinning
-    ///   small/medium blocks continuously at every slider position.
-    ///
-    /// At `abstraction == 0.0` both reduce to today's exact constants, so the
-    /// detail end preserves prior behavior.
+    /// The render posture's resolved nesting gate for this frame. See
+    /// `resolve_nest_gate` for the mapping.
     fn nest_gate(&self) -> NestGate {
-        let a = self.abstraction.clamp(0.0, 1.0);
-        let depth_span = (MAX_DEPTH - 1) as f32;
-        let max_depth = (1.0 + depth_span * (1.0 - a).powi(2)).round() as usize;
-        let side_scale = 1.0 + a * ABSTRACTION_SIDE_GAIN;
-        NestGate {
-            max_depth,
-            min_side: MIN_NEST_SIDE * side_scale,
-            min_area: MIN_NEST_AREA * side_scale * side_scale,
-        }
+        resolve_nest_gate(self.abstraction)
     }
 
     /// Recomputes the drawer's analytics if the focus or the tree has
@@ -1789,7 +1796,13 @@ fn bench_scene(label: &str, tree: Entry) {
     let root = Node::from_entry(&tree);
     let viewport = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1280.0, 760.0));
     let mut blocks: Vec<BenchBlock> = Vec::new();
-    collect_bench_blocks(&root, viewport.shrink(BLOCK_PAD), 0, &mut blocks);
+    collect_bench_blocks(
+        &root,
+        viewport.shrink(BLOCK_PAD),
+        0,
+        resolve_nest_gate(0.0),
+        &mut blocks,
+    );
 
     let cards = blocks
         .iter()
@@ -1857,8 +1870,17 @@ struct BenchBlock {
 
 /// Mirrors `draw_children`'s layout rules (sort, squarify, nest condition) to
 /// collect the set of blocks that would be painted, without touching a
-/// `Painter`. Spike-only.
-fn collect_bench_blocks(node: &Node, rect: Rect, depth: usize, out: &mut Vec<BenchBlock>) {
+/// `Painter`. `gate` is the render posture's resolved `NestGate` (see
+/// `resolve_nest_gate`) — the `--debug-perf` bench always passes the detail
+/// gate (`resolve_nest_gate(0.0)`) since it measures today's default posture;
+/// unit tests pass both detail and abstract gates to compare block counts.
+fn collect_bench_blocks(
+    node: &Node,
+    rect: Rect,
+    depth: usize,
+    gate: NestGate,
+    out: &mut Vec<BenchBlock>,
+) {
     if node.children.is_empty() || rect.width() < 1.0 || rect.height() < 1.0 {
         return;
     }
@@ -1877,10 +1899,10 @@ fn collect_bench_blocks(node: &Node, rect: Rect, depth: usize, out: &mut Vec<Ben
         }
         let block = Rect::from_min_size(Pos2::new(r.x, r.y), Vec2::new(r.w, r.h)).shrink(0.5);
         let nestable = child.is_dir
-            && depth < MAX_DEPTH
-            && block.area() > MIN_NEST_AREA
-            && block.width() > MIN_NEST_SIDE
-            && block.height() > MIN_NEST_SIDE + DIR_LABEL_H;
+            && depth < gate.max_depth
+            && block.area() > gate.min_area
+            && block.width() > gate.min_side
+            && block.height() > gate.min_side + DIR_LABEL_H;
         out.push(BenchBlock {
             rect: block,
             is_dir: child.is_dir,
@@ -1893,7 +1915,7 @@ fn collect_bench_blocks(node: &Node, rect: Rect, depth: usize, out: &mut Vec<Ben
                 block.left_top() + Vec2::new(inset, DIR_LABEL_H + inset),
                 block.right_bottom() - Vec2::new(inset, inset),
             );
-            collect_bench_blocks(child, inner, depth + 1, out);
+            collect_bench_blocks(child, inner, depth + 1, gate, out);
         }
     }
 }
@@ -2086,6 +2108,140 @@ fn synth_all_cards_tree() -> Entry {
         size,
         is_dir: true,
         children,
+    }
+}
+
+#[cfg(test)]
+mod abstraction_tests {
+    use super::*;
+
+    #[test]
+    fn detail_end_matches_todays_constants_exactly() {
+        let gate = resolve_nest_gate(0.0);
+        assert_eq!(gate.max_depth, MAX_DEPTH);
+        assert_eq!(gate.min_side, MIN_NEST_SIDE);
+        assert_eq!(gate.min_area, MIN_NEST_AREA);
+    }
+
+    #[test]
+    fn abstract_end_drops_depth_to_the_floor_and_scales_size_up() {
+        let gate = resolve_nest_gate(1.0);
+        assert_eq!(gate.max_depth, 1, "full abstract must cap depth at its floor of 1");
+        assert_eq!(gate.min_side, MIN_NEST_SIDE * (1.0 + ABSTRACTION_SIDE_GAIN));
+        assert_eq!(
+            gate.min_area,
+            MIN_NEST_AREA * (1.0 + ABSTRACTION_SIDE_GAIN) * (1.0 + ABSTRACTION_SIDE_GAIN)
+        );
+    }
+
+    #[test]
+    fn depth_and_size_thresholds_move_monotonically_toward_abstract() {
+        let steps = [0.0, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 1.0];
+        let gates: Vec<NestGate> = steps.iter().map(|&a| resolve_nest_gate(a)).collect();
+        for pair in gates.windows(2) {
+            assert!(
+                pair[1].max_depth <= pair[0].max_depth,
+                "depth cap must never rise as abstraction increases"
+            );
+            assert!(
+                pair[1].min_side >= pair[0].min_side,
+                "size threshold must never fall as abstraction increases"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_abstraction_is_clamped() {
+        assert_eq!(resolve_nest_gate(-1.0), resolve_nest_gate(0.0));
+        assert_eq!(resolve_nest_gate(2.0), resolve_nest_gate(1.0));
+    }
+
+    /// Builds `chains` top-level directories, each a single-child chain
+    /// `chainN/lvl0/lvl1/.../lvl{chain_len-1}/leaf.bin`, every leaf the same
+    /// size. Single-child directories always get ~the full parent rect from
+    /// `squarify` (nothing to split against), so the block stays large enough
+    /// to clear the pixel-size gate for many levels regardless of viewport —
+    /// isolating the depth cap as the only thing that can stop nesting, which
+    /// is exactly what the tests below need to exercise.
+    fn build_chain_tree(chains: usize, chain_len: usize) -> Node {
+        let mut root = Node::new("root".to_string(), PathBuf::from("root"), 0, true);
+        for c in 0..chains {
+            let mut rel = PathBuf::new();
+            rel.push(format!("chain{c}"));
+            for lvl in 0..chain_len {
+                rel.push(format!("lvl{lvl}"));
+            }
+            rel.push("leaf.bin");
+            root.insert(&rel, 10_000_000, false);
+        }
+        root
+    }
+
+    /// Core block-count check for the abstraction mechanism (tasks.md 4.1):
+    /// the same nested tree renders strictly fewer visible blocks, and
+    /// strictly fewer directories expand into their children, under the
+    /// abstract posture than under detail.
+    #[test]
+    fn abstract_posture_renders_fewer_blocks_than_detail_on_the_same_tree() {
+        let root = build_chain_tree(2, 6);
+        let viewport = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1280.0, 760.0));
+
+        let mut detail_blocks = Vec::new();
+        collect_bench_blocks(
+            &root,
+            viewport.shrink(BLOCK_PAD),
+            0,
+            resolve_nest_gate(0.0),
+            &mut detail_blocks,
+        );
+
+        let mut abstract_blocks = Vec::new();
+        collect_bench_blocks(
+            &root,
+            viewport.shrink(BLOCK_PAD),
+            0,
+            resolve_nest_gate(1.0),
+            &mut abstract_blocks,
+        );
+
+        let nestable_count = |blocks: &[BenchBlock]| blocks.iter().filter(|b| b.nestable).count();
+
+        assert!(
+            abstract_blocks.len() < detail_blocks.len(),
+            "abstract ({}) should render fewer total blocks than detail ({})",
+            abstract_blocks.len(),
+            detail_blocks.len()
+        );
+        assert!(
+            nestable_count(&abstract_blocks) < nestable_count(&detail_blocks),
+            "abstract should expand fewer directories into their children than detail"
+        );
+        // Detail recurses through Program Files/App/sub down to individual
+        // res*.bin files, so it must reach the depth-4 file level; abstract's
+        // depth-1 cap must not.
+        assert!(detail_blocks.iter().any(|b| b.depth >= 3));
+        assert!(abstract_blocks.iter().all(|b| b.depth <= 1));
+    }
+
+    #[test]
+    fn abstract_posture_still_shows_at_least_the_top_level_blocks() {
+        let root = build_chain_tree(2, 6);
+        let viewport = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1280.0, 760.0));
+
+        let mut abstract_blocks = Vec::new();
+        collect_bench_blocks(
+            &root,
+            viewport.shrink(BLOCK_PAD),
+            0,
+            resolve_nest_gate(1.0),
+            &mut abstract_blocks,
+        );
+
+        // The root's direct children (both chains) must still all be present
+        // as blocks — abstraction hides *interior* structure, never the top
+        // level itself.
+        let top_level = abstract_blocks.iter().filter(|b| b.depth == 0).count();
+        assert_eq!(top_level, root.children.len());
     }
 }
 
