@@ -16,6 +16,10 @@ pain points: it's slow, and it looks like a 2010-era Win32 app.
   breadcrumb/back to zoom out
 - Right-click actions — Delete / Open / Reveal in Explorer
 - Deterministic, themed block coloring by file type
+- Insights drawer — extension color legend, size breakdown, biggest
+  files/folders leaderboard, small-file-blizzard and known-junk flags
+- Abstraction slider — collapse the map to fewer, bigger top-level blocks;
+  hover a collapsed block for a non-committal preview of its contents
 
 See [rust-space-sniffer-overview.md](rust-space-sniffer-overview.md) for the
 full design rationale, tech stack decisions, and planned V2 work (filtering,
@@ -87,6 +91,7 @@ src/
     walker.rs    — parallel (rayon) directory-walk ScanEngine implementation
   treemap.rs     — pure squarified-treemap layout algorithm (Bruls/Huizing/van Wijk 1999)
   theme.rs       — color palette + deterministic hash-derived color-from-extension logic
+  insights.rs    — pure, egui-free derived analytics (legend, leaderboard, blizzard/junk flags)
   util.rs        — byte-size formatting
 ```
 
@@ -107,6 +112,14 @@ Every scanning backend implements the `ScanEngine` trait: `name()`, `is_availabl
 ### Theming
 
 Directories are fixed muted-slate (not hue-coded) so hue-coded files carry the signal. File colors come from an FNV-1a hash of the lowercased extension, mapped to hue, with fixed saturation/value (see `BLOCK_SATURATION`/`BLOCK_VALUE`) for a curated look. Nesting depth uses capped lightness lift (see `theme::depth_shift`), not new hues. Accent color (hover, breadcrumb, selection) is reserved and never reused.
+
+### Abstraction slider
+
+A toolbar slider (`0.0` detail .. `1.0` abstract) tightens the same pixel-size gates `draw_children` already uses to decide whether to recurse into a directory (`resolve_nest_gate` in `app.rs`) — fewer, bigger top-level blocks as it moves toward `1.0`. `squarify` itself is untouched; only how often it's invoked recursively changes. Hovering a collapsed directory block shows a temporary, non-committal preview of its contents without changing focus/breadcrumb — moving the pointer away discards it, and clicking still drills down exactly as before.
+
+### Insights drawer
+
+A collapsible left-side panel (toolbar toggle, closed by default) presenting derived analytics over the currently focused subtree — extension color legend, size-by-extension breakdown, biggest-entries leaderboard, small-file-blizzard and known-junk flags. All of it is computed in `insights.rs` from the tree a scan already produced, with no new scanning cost; clicking a leaderboard entry focuses the treemap on that path via the existing navigation state.
 
 ## Development
 

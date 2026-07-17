@@ -48,6 +48,7 @@ src/
     walker.rs    — parallel (rayon) directory-walk ScanEngine implementation
   treemap.rs     — pure squarified-treemap layout algorithm (Bruls/Huizing/van Wijk 1999)
   theme.rs       — color palette + deterministic hash-derived color-from-extension logic
+  insights.rs    — pure, egui-free derived analytics over a scanned tree (legend, leaderboard, blizzard/junk flags); rendered by app.rs's Insights drawer
   util.rs        — byte-size formatting
 ```
 
@@ -70,6 +71,14 @@ A scan runs on its own thread. `ScanContext` carries a cancellation flag, atomic
 ### Theming
 
 Directories get a fixed muted-slate color (not hue-coded) so hue-coded files carry the color signal. File colors come from an FNV-1a hash of the lowercased extension mapped to a hue, with saturation/value fixed to a band (`BLOCK_SATURATION`/`BLOCK_VALUE`) so the palette reads as curated rather than random. Nesting depth is communicated via a capped lightness lift (`theme::depth_shift`), not new hues. The single accent color is reserved for hover, the active breadcrumb entry, and selection — nothing else.
+
+### Abstraction slider
+
+The toolbar's abstraction slider (`app.rs`'s `self.abstraction`, `0.0` detail .. `1.0` abstract) doesn't touch `treemap::squarify` itself — it only tightens the same `MIN_NEST_AREA`/`MIN_NEST_SIDE`/`MAX_DEPTH`-style gates `draw_children` already uses to decide whether to recurse into a directory, via `resolve_nest_gate`. At `abstraction == 0.0` the gates reduce to the original constants exactly, so this is additive, not a behavior change to the default view. A directory collapsed by the tightened gate still supports a hover-only, non-committal preview of its contents (no focus/breadcrumb change) — see the `2026-07-17-add-treemap-abstraction-mode` spec for why the mechanism reuses gate-tightening rather than a separate render path, and `mod abstraction_tests` in `app.rs` for the invariants that must hold as `abstraction` moves (gates only ever tighten, top-level block count is never hidden, only interior structure).
+
+### Insights drawer
+
+`src/insights.rs` computes derived analytics (extension legend, size-by-extension breakdown, biggest-entries leaderboard, small-file-blizzard and known-junk flags) over an `InsightNode` — a minimal borrowed view that both `app::Node` and `scanner::Entry` can produce, so the aggregation logic never depends on either concrete tree type and stays unit-testable without a display, mirroring `treemap.rs`/`scanner/`. `app.rs` renders the results in a collapsible left-side panel (`self.insights_open`, closed by default — the app stays "a pure graphical map" per `rust-space-sniffer-overview.md` §5 until the drawer is explicitly summoned) and wires leaderboard clicks into the existing `focus` navigation state. Recomputed whenever the focused node or tree revision changes; no new scan data or scanner changes involved.
 
 ## Development process
 
