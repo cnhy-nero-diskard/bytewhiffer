@@ -8,9 +8,9 @@
 
 ## 2. Render posture state and control
 
-- [ ] 2.1 Add a render posture slider field to `BytewhifferApp` (scales `MIN_NEST_AREA`/`MIN_NEST_SIDE`) alongside the existing `render_dense`/`density_key` fields
-- [ ] 2.2 Add a chrome slider control for setting the posture
-- [ ] 2.3 Wire the slider's scale factor into `draw_children`'s collapse/recurse decision, multiplying the existing `MIN_NEST_AREA`/`MIN_NEST_SIDE` pixel-size gate
+- [x] 2.1 Add a render posture slider field to `BytewhifferApp` (`abstraction: f32`, 0.0 = detail via `derive(Default)`) plus a `nest_scale()` helper and `ABSTRACTION_NEST_GAIN` constant, alongside the existing `render_dense`/`density_key` fields
+- [x] 2.2 Add a chrome slider control (Detail ↔ Abstract) to `toolbar`, after the Insights button
+- [x] 2.3 Wire the slider's scale factor into `draw_children` (new `nest_scale` param) — multiplies `MIN_NEST_SIDE` and squares into `MIN_NEST_AREA` in the `would_nest` gate; threaded through both call sites (`treemap_panel` + the recursive call)
 
 ## 3. Hover preview
 

@@ -22,6 +22,11 @@ use crate::util::{elide_middle, format_duration, format_size};
 /// be readable or clickable anyway.
 const MIN_NEST_AREA: f32 = 1200.0;
 const MIN_NEST_SIDE: f32 = 24.0;
+/// Extra multiplier the render-posture slider adds to the nesting gate at its
+/// abstract end: at full abstract a block must be `1.0 + ABSTRACTION_NEST_GAIN`
+/// times larger per side to still nest, folding more directories into single
+/// collapsed blocks. See `BytewhifferApp::nest_scale`.
+const ABSTRACTION_NEST_GAIN: f32 = 2.0;
 /// Hard depth cap as a backstop against pathological trees.
 const MAX_DEPTH: usize = 10;
 /// How many entries the biggest-files/folders leaderboard shows.
@@ -309,6 +314,14 @@ pub struct BytewhifferApp {
     /// count off the per-frame path so pointer/hover tracking stays responsive.
     render_dense: bool,
     density_key: Option<(Vec<String>, u64)>,
+    /// Render posture: 0.0 = detail (today's exact nesting gates), rising
+    /// toward 1.0 = abstract (fewer, larger blocks). Drives a multiplier on
+    /// `MIN_NEST_AREA`/`MIN_NEST_SIDE` in `draw_children` so more directories
+    /// stay collapsed. Manual only — the user drags the toolbar slider; there
+    /// is no density-based auto-engage. Defaults to 0.0 via `derive(Default)`,
+    /// which is the detail end, preserving prior behavior. See
+    /// `BytewhifferApp::nest_scale`.
+    abstraction: f32,
 }
 
 impl BytewhifferApp {
@@ -517,6 +530,16 @@ impl BytewhifferApp {
                 self.insights_open = !self.insights_open;
             }
 
+            // Render-posture slider: detail (left, today's nesting) → abstract
+            // (right, fewer/larger blocks). Manual only; drives `nest_scale`.
+            ui.colored_label(theme::TEXT_SUBTLE, "Detail");
+            ui.add(
+                egui::Slider::new(&mut self.abstraction, 0.0..=1.0)
+                    .show_value(false)
+                    .trailing_fill(true),
+            );
+            ui.colored_label(theme::TEXT_SUBTLE, "Abstract");
+
             if let Some(scan) = &self.scan {
                 if chrome_button(ui, "Cancel", true).clicked() {
                     scan.ctx.cancel.store(true, Ordering::Relaxed);
@@ -658,6 +681,7 @@ impl BytewhifferApp {
         // tracking) stays responsive. Cached, so this is a field read here.
         self.refresh_density();
         let dense = self.render_dense;
+        let nest_scale = self.nest_scale();
 
         let avail = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(avail, Sense::click());
@@ -708,6 +732,7 @@ impl BytewhifferApp {
             &mut Vec::new(),
             &mut hits,
             dense,
+            nest_scale,
         );
 
         // Deepest block under the pointer wins: children are pushed after
@@ -826,6 +851,17 @@ impl BytewhifferApp {
             .unwrap_or(0);
         self.render_dense = count > DENSE_RENDER_THRESHOLD;
         self.density_key = Some(key);
+    }
+
+    /// Linear multiplier the render posture applies to the nesting gate's
+    /// pixel thresholds (`MIN_NEST_SIDE`, and its square for the 2D
+    /// `MIN_NEST_AREA`). At the detail end (`abstraction == 0.0`) this is
+    /// exactly 1.0, so the gate matches today's constants; at the abstract
+    /// end (`abstraction == 1.0`) it reaches `1.0 + ABSTRACTION_NEST_GAIN`,
+    /// raising the bar a block must clear to nest so more directories render
+    /// as one collapsed block.
+    fn nest_scale(&self) -> f32 {
+        1.0 + self.abstraction.clamp(0.0, 1.0) * ABSTRACTION_NEST_GAIN
     }
 
     /// Recomputes the drawer's analytics if the focus or the tree has
@@ -1233,6 +1269,7 @@ fn draw_children(
     trail: &mut Vec<String>,
     hits: &mut Vec<HitRect>,
     dense: bool,
+    nest_scale: f32,
 ) {
     if node.children.is_empty() || rect.width() < 1.0 || rect.height() < 1.0 {
         return;
@@ -1275,10 +1312,14 @@ fn draw_children(
         // header-height bar but not the stricter nesting-area/side gate —
         // reads as a hole, not a directory. Below that bar it's just a plain
         // labeled card, like a file.
+        // The render posture scales the pixel-size gate: `nest_scale` is 1.0
+        // at the detail end (matching today's constants) and rises toward the
+        // abstract end so a block must be proportionally larger to still nest.
+        // Area is 2D, so it takes the square of the linear side multiplier.
         let would_nest = depth < MAX_DEPTH
-            && block.area() > MIN_NEST_AREA
-            && block.width() > MIN_NEST_SIDE
-            && block.height() > MIN_NEST_SIDE + DIR_LABEL_H;
+            && block.area() > MIN_NEST_AREA * nest_scale * nest_scale
+            && block.width() > MIN_NEST_SIDE * nest_scale
+            && block.height() > MIN_NEST_SIDE * nest_scale + DIR_LABEL_H;
         let tray = child.is_dir && card_eligible && would_nest;
 
         if tray {
@@ -1312,7 +1353,7 @@ fn draw_children(
                 Pos2::new(block.left() + inset, block.top() + DIR_LABEL_H + inset),
                 Pos2::new(block.right() - inset, block.bottom() - inset),
             );
-            draw_children(painter, effective, inner, depth + 1, trail, hits, dense);
+            draw_children(painter, effective, inner, depth + 1, trail, hits, dense, nest_scale);
 
             for _ in 0..chain_len {
                 trail.pop();
