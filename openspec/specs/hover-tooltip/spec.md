@@ -1,4 +1,12 @@
-## ADDED Requirements
+# hover-tooltip
+
+## Purpose
+Defines the floating path/size tooltip that follows the pointer while
+hovering a treemap block: its text formatting for long paths, and its
+responsiveness to pointer movement regardless of how many blocks are
+currently visible.
+
+## Requirements
 
 ### Requirement: Tooltip content stays legible at any anchor position
 The system SHALL bound the hover tooltip's displayed path text to a fixed-width, single-line representation — eliding the middle of long paths rather than allowing them to wrap — so the tooltip remains legible regardless of where the popup is anchored on screen.
