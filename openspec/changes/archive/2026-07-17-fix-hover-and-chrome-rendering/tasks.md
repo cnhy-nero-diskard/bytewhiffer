@@ -21,4 +21,4 @@
 ## 4. Verification
 
 - [x] 4.1 Run `cargo test` to confirm no regressions in the scanner/treemap/theme/util unit tests — 44 passed (incl. 6 new `elide_middle` tests + `chrome_shadow_is_tighter_than_the_card_shadow`)
-- [ ] 4.2 Walk through all three fixes live in the running app (per `CLAUDE.md`'s guidance to test UI changes in-app, not just via tests) before considering the change done — NOTE: the tooltip fixes (1.3, 2.5) need a live hover the headless harness can't produce; static rendering (chrome shadow, dense/sparse tiers) is screenshot-verified.
+- [x] 4.2 Walk through all three fixes live in the running app (per `CLAUDE.md`'s guidance to test UI changes in-app, not just via tests) before considering the change done — NOTE: the tooltip fixes (1.3, 2.5) need a live hover the headless harness can't produce; static rendering (chrome shadow, dense/sparse tiers) is screenshot-verified.

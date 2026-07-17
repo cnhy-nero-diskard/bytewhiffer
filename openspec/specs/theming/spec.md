@@ -64,11 +64,14 @@ no meaning.
 - **THEN** their frame border/tint hues differ, while both stay within the
   same muted saturation/value band reserved for directories
 
-#### Scenario: Chrome shares the same elevation language as the treemap
+#### Scenario: Chrome shares the same elevation language as the treemap, scaled to its own size
 - **WHEN** the toolbar or breadcrumb bar is rendered
 - **THEN** its interactive elements (buttons, path field, breadcrumb links)
-  use the same gradient/shadow/radius treatment as treemap blocks, scaled
-  appropriately, rather than stock unstyled widget visuals
+  use the same gradient/shadow/radius treatment as treemap blocks, but with
+  shadow blur and offset tuned to chrome's own (smaller) element scale
+  rather than reusing the block-scale shadow values unscaled, so the shadow
+  reads as a subtle lift rather than a distinct, doubled-looking shape at
+  chrome's typical element size
 
 ### Requirement: Single-child directory chains collapse into one header
 The system SHALL, when rendering a run of consecutive directories each

@@ -22,6 +22,16 @@ use crate::util::{elide_middle, format_duration, format_size};
 /// be readable or clickable anyway.
 const MIN_NEST_AREA: f32 = 1200.0;
 const MIN_NEST_SIDE: f32 = 24.0;
+/// At the abstract end of the render-posture slider the nesting gate's minimum
+/// side is multiplied by up to `1.0 + ABSTRACTION_SIDE_GAIN` (and its square
+/// for area), so small/medium blocks collapse before the depth cap alone would
+/// reach them. Kept absolute (not viewport-relative) and modest so it thins
+/// blocks uniformly by pixel size without ever leaving one whole pane detailed
+/// while a sibling collapses. See `BytewhifferApp::nest_gate`.
+const ABSTRACTION_SIDE_GAIN: f32 = 4.0;
+/// Padding between a collapsed block's edge and the hover-preview squarify
+/// laid out inside it, so the accent frame and a rim of the block still read.
+const PREVIEW_INSET: f32 = 3.0;
 /// Hard depth cap as a backstop against pathological trees.
 const MAX_DEPTH: usize = 10;
 /// How many entries the biggest-files/folders leaderboard shows.
@@ -195,6 +205,52 @@ struct ActiveScan {
     handle: Option<JoinHandle<Result<Entry, ScanError>>>,
 }
 
+/// The render posture's resolved nesting gate for one frame: a directory
+/// subdivides only if it is shallower than `max_depth` *and* clears the pixel
+/// thresholds. Both tighten together as the abstraction slider moves toward
+/// abstract — the depth cap gives a uniform "top-level only" endpoint, the
+/// size scale gives continuous thinning at every slider position regardless of
+/// how deep the tree happens to be. See `BytewhifferApp::nest_gate`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct NestGate {
+    max_depth: usize,
+    min_side: f32,
+    min_area: f32,
+}
+
+/// Resolves an `abstraction` slider value (0.0 detail .. 1.0 abstract) into a
+/// `NestGate`. Combines two levers that both tighten toward the abstract end:
+///
+/// - **Depth cap** — full `MAX_DEPTH` at detail, dropping to a floor of 1 at
+///   abstract, where only the focused node's direct children nest a single
+///   level and everything deeper collapses. This is what makes "fully
+///   abstract" reliably mean "only the top-level blocks show interior",
+///   *uniformly* across every branch regardless of pixel size. The mapping is
+///   concave (`(1 - a)^2`) because real trees rarely render deeper than ~5-6
+///   levels, so a linear 10→1 ramp would leave the slider's left half doing
+///   nothing; squaring front-loads the drop.
+/// - **Size scale** — multiplies `MIN_NEST_SIDE`/`MIN_NEST_AREA` by up to
+///   `1.0 + ABSTRACTION_SIDE_GAIN`. The depth cap only bites once a branch is
+///   deeper than the cap, so on a shallow tree it can do nothing until near
+///   the abstract end; the size scale fills that gap by thinning small/medium
+///   blocks continuously at every slider position.
+///
+/// At `abstraction == 0.0` both reduce to today's exact constants, so the
+/// detail end preserves prior behavior. A free function (not a method) so it
+/// can be unit-tested and reused by the `--debug-perf` bench without needing a
+/// live `BytewhifferApp`.
+fn resolve_nest_gate(abstraction: f32) -> NestGate {
+    let a = abstraction.clamp(0.0, 1.0);
+    let depth_span = (MAX_DEPTH - 1) as f32;
+    let max_depth = (1.0 + depth_span * (1.0 - a).powi(2)).round() as usize;
+    let side_scale = 1.0 + a * ABSTRACTION_SIDE_GAIN;
+    NestGate {
+        max_depth,
+        min_side: MIN_NEST_SIDE * side_scale,
+        min_area: MIN_NEST_AREA * side_scale * side_scale,
+    }
+}
+
 /// One rendered treemap block that can be hovered/clicked, with the trail
 /// of names leading to it from the focus node.
 struct HitRect {
@@ -203,6 +259,22 @@ struct HitRect {
     fs_path: PathBuf,
     is_dir: bool,
     size: u64,
+    /// True only for a directory rendered as a single collapsed block (not a
+    /// tray with its children nested in). These are the blocks the abstract
+    /// posture's hover preview peeks into; files and expanded trays are false.
+    collapsed: bool,
+}
+
+/// A cached hover-preview overlay: the pre-tessellated child shapes for the
+/// collapsed directory block currently being peeked into, plus the key they
+/// were built for. Rebuilt only when the hovered path, the tree revision, or
+/// the block's on-screen rect changes — never per frame, mirroring the
+/// `refresh_density`/`refresh_insights` caching discipline. `None` whenever
+/// nothing eligible is hovered, so the preview naturally clears on pointer-out.
+struct PreviewOverlay {
+    /// (previewed dir path, tree revision, block rect rounded to whole pixels).
+    key: (PathBuf, u64, [i32; 4]),
+    shapes: Vec<egui::Shape>,
 }
 
 /// What moment the hidden `--debug-screenshot*` mode should capture.
@@ -309,6 +381,18 @@ pub struct BytewhifferApp {
     /// count off the per-frame path so pointer/hover tracking stays responsive.
     render_dense: bool,
     density_key: Option<(Vec<String>, u64)>,
+    /// Render posture: 0.0 = detail (today's full nesting), rising toward 1.0 =
+    /// abstract (fewer, larger blocks). Drives the frame's `NestGate` — a depth
+    /// cap dropping toward 1 plus a rising size threshold — so branches collapse
+    /// after fewer levels and small blocks fold away. Manual only: the user
+    /// drags the toolbar slider; there is no density-based auto-engage. Defaults
+    /// to 0.0 via `derive(Default)`, the detail end, preserving prior behavior.
+    /// See `BytewhifferApp::nest_gate`.
+    abstraction: f32,
+    /// Cached hover-preview overlay for the collapsed directory block under
+    /// the pointer in abstract mode; `None` when nothing eligible is hovered.
+    /// Purely presentational — never touches `focus`/breadcrumb state.
+    preview: Option<PreviewOverlay>,
 }
 
 impl BytewhifferApp {
@@ -517,6 +601,16 @@ impl BytewhifferApp {
                 self.insights_open = !self.insights_open;
             }
 
+            // Render-posture slider: detail (left, today's nesting) → abstract
+            // (right, fewer/larger blocks). Manual only; drives `nest_scale`.
+            ui.colored_label(theme::TEXT_SUBTLE, "Detail");
+            ui.add(
+                egui::Slider::new(&mut self.abstraction, 0.0..=1.0)
+                    .show_value(false)
+                    .trailing_fill(true),
+            );
+            ui.colored_label(theme::TEXT_SUBTLE, "Abstract");
+
             if let Some(scan) = &self.scan {
                 if chrome_button(ui, "Cancel", true).clicked() {
                     scan.ctx.cancel.store(true, Ordering::Relaxed);
@@ -660,6 +754,7 @@ impl BytewhifferApp {
         let dense = self.render_dense;
 
         let avail = ui.available_rect_before_wrap();
+        let gate = self.nest_gate();
         let response = ui.allocate_rect(avail, Sense::click());
         let painter = ui.painter_at(avail);
         painter.rect_filled(avail, 0.0, theme::BG);
@@ -708,6 +803,7 @@ impl BytewhifferApp {
             &mut Vec::new(),
             &mut hits,
             dense,
+            gate,
         );
 
         // Deepest block under the pointer wins: children are pushed after
@@ -718,6 +814,44 @@ impl BytewhifferApp {
         self.hovered_path = hovered.map(|h| h.fs_path.clone());
         self.hovered_size = hovered.map(|h| h.size);
         if let Some(hit) = hovered {
+            // Abstract-posture hover preview: peek inside a collapsed directory
+            // block without drilling in. Painted under the accent frame below so
+            // that frame reads as the preview's border. Purely presentational —
+            // it never mutates `self.focus`/breadcrumb, and clicking still drills
+            // (handled unchanged further down). The overlay shapes are cached on
+            // (path, tree_rev, block rect) so a stationary hover isn't re-laid
+            // out every frame. Any non-eligible hover clears the cache.
+            let preview_node = (self.abstraction > 0.0 && hit.collapsed)
+                .then(|| focus_node.find(&hit.trail))
+                .flatten()
+                .filter(|n| !n.children.is_empty());
+            if let Some(node) = preview_node {
+                let outer = hit.rect;
+                let key = (
+                    hit.fs_path.clone(),
+                    self.tree_rev,
+                    [
+                        outer.left() as i32,
+                        outer.top() as i32,
+                        outer.width() as i32,
+                        outer.height() as i32,
+                    ],
+                );
+                if self.preview.as_ref().map(|p| &p.key) != Some(&key) {
+                    let mut shapes = Vec::new();
+                    build_preview_shapes(node, outer.shrink(PREVIEW_INSET), 1, &mut shapes);
+                    self.preview = Some(PreviewOverlay { key, shapes });
+                }
+                // Repaint the block's fill so the collapsed rendering beneath
+                // doesn't bleed through, then the cached child shapes on top.
+                painter.rect_filled(outer, theme::CARD_CORNER_RADIUS, theme::BG);
+                if let Some(p) = &self.preview {
+                    painter.extend(p.shapes.iter().cloned());
+                }
+            } else {
+                self.preview = None;
+            }
+
             painter.rect_stroke(
                 hit.rect,
                 theme::CARD_CORNER_RADIUS,
@@ -754,6 +888,9 @@ impl BytewhifferApp {
                 trail.extend(hit.trail.iter().cloned());
                 self.context_target = Some((trail, hit.fs_path.clone(), hit.is_dir));
             }
+        } else {
+            // Pointer is over no block — discard any open preview.
+            self.preview = None;
         }
 
         response.context_menu(|ui| self.context_menu_contents(ui));
@@ -826,6 +963,12 @@ impl BytewhifferApp {
             .unwrap_or(0);
         self.render_dense = count > DENSE_RENDER_THRESHOLD;
         self.density_key = Some(key);
+    }
+
+    /// The render posture's resolved nesting gate for this frame. See
+    /// `resolve_nest_gate` for the mapping.
+    fn nest_gate(&self) -> NestGate {
+        resolve_nest_gate(self.abstraction)
     }
 
     /// Recomputes the drawer's analytics if the focus or the tree has
@@ -1233,6 +1376,7 @@ fn draw_children(
     trail: &mut Vec<String>,
     hits: &mut Vec<HitRect>,
     dense: bool,
+    gate: NestGate,
 ) {
     if node.children.is_empty() || rect.width() < 1.0 || rect.height() < 1.0 {
         return;
@@ -1275,10 +1419,15 @@ fn draw_children(
         // header-height bar but not the stricter nesting-area/side gate —
         // reads as a hole, not a directory. Below that bar it's just a plain
         // labeled card, like a file.
-        let would_nest = depth < MAX_DEPTH
-            && block.area() > MIN_NEST_AREA
-            && block.width() > MIN_NEST_SIDE
-            && block.height() > MIN_NEST_SIDE + DIR_LABEL_H;
+        // The render posture supplies the whole gate: at the detail end its
+        // fields are today's `MAX_DEPTH`/`MIN_NEST_*` constants; toward the
+        // abstract end the depth cap drops and the size thresholds rise, so
+        // branches stop nesting sooner and small blocks collapse (see
+        // `nest_gate`).
+        let would_nest = depth < gate.max_depth
+            && block.area() > gate.min_area
+            && block.width() > gate.min_side
+            && block.height() > gate.min_side + DIR_LABEL_H;
         let tray = child.is_dir && card_eligible && would_nest;
 
         if tray {
@@ -1301,6 +1450,7 @@ fn draw_children(
                 fs_path: effective.path.clone(),
                 is_dir: true,
                 size: effective.size,
+                collapsed: false,
             });
 
             // Children pack flush against the frame's border line — depth
@@ -1312,7 +1462,7 @@ fn draw_children(
                 Pos2::new(block.left() + inset, block.top() + DIR_LABEL_H + inset),
                 Pos2::new(block.right() - inset, block.bottom() - inset),
             );
-            draw_children(painter, effective, inner, depth + 1, trail, hits, dense);
+            draw_children(painter, effective, inner, depth + 1, trail, hits, dense, gate);
 
             for _ in 0..chain_len {
                 trail.pop();
@@ -1356,6 +1506,9 @@ fn draw_children(
                 fs_path: child.path.clone(),
                 is_dir: child.is_dir,
                 size: child.size,
+                // A directory that reached the flat branch didn't nest, so it
+                // is rendered as one collapsed block — the preview's target.
+                collapsed: child.is_dir,
             });
 
             // Corner label when there's room. Threshold is lower than a full
@@ -1374,6 +1527,63 @@ fn draw_children(
             }
 
             trail.pop();
+        }
+    }
+}
+
+/// Builds the hover-preview overlay's shapes: a squarified peek at `node`'s
+/// contents laid out inside `rect`, mirroring `draw_children`'s sort +
+/// `squarify` + color rules but emitting `egui::Shape`s into `out` instead of
+/// painting, so the caller can cache and re-paint them without recomputing.
+/// The preview is non-committal (never hit-tested, never touches focus), so it
+/// skips labels, elevation, and hit-rect bookkeeping — just enough structure
+/// to answer "what's in here". Recursion uses the detail-posture nesting gate
+/// (`nest_scale` = 1.0) so the peek shows the same structure a drill-down would.
+fn build_preview_shapes(node: &Node, rect: Rect, depth: usize, out: &mut Vec<egui::Shape>) {
+    if node.children.is_empty() || rect.width() < 1.0 || rect.height() < 1.0 {
+        return;
+    }
+    let mut order: Vec<usize> = (0..node.children.len()).collect();
+    order.sort_by(|&a, &b| node.children[b].size.cmp(&node.children[a].size));
+    let sizes: Vec<u64> = order.iter().map(|&i| node.children[i].size).collect();
+    let layout = treemap::squarify(
+        &sizes,
+        treemap::Rect::new(rect.left(), rect.top(), rect.width(), rect.height()),
+    );
+    for (k, &i) in order.iter().enumerate() {
+        let child = &node.children[i];
+        let r = layout[k];
+        if r.w <= 1.0 || r.h <= 1.0 {
+            continue;
+        }
+        let block = Rect::from_min_size(Pos2::new(r.x, r.y), Vec2::new(r.w, r.h)).shrink(0.5);
+        let base = theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
+        let radius = if block.width() >= MIN_CARD_SIDE && block.height() >= MIN_CARD_SIDE {
+            theme::CARD_CORNER_RADIUS
+        } else {
+            0.0
+        };
+        out.push(egui::Shape::rect_filled(block, radius, base));
+        if block.width() >= 4.0 && block.height() >= 4.0 {
+            out.push(egui::Shape::rect_stroke(
+                block,
+                radius,
+                Stroke::new(1.0, theme::BLOCK_BORDER),
+                StrokeKind::Inside,
+            ));
+        }
+        let nestable = child.is_dir
+            && depth + 1 < MAX_DEPTH
+            && block.area() > MIN_NEST_AREA
+            && block.width() > MIN_NEST_SIDE
+            && block.height() > MIN_NEST_SIDE + DIR_LABEL_H;
+        if nestable {
+            let inset = theme::DIR_FRAME_BORDER_WIDTH;
+            let inner = Rect::from_min_max(
+                Pos2::new(block.left() + inset, block.top() + DIR_LABEL_H + inset),
+                Pos2::new(block.right() - inset, block.bottom() - inset),
+            );
+            build_preview_shapes(child, inner, depth + 1, out);
         }
     }
 }
@@ -1586,7 +1796,13 @@ fn bench_scene(label: &str, tree: Entry) {
     let root = Node::from_entry(&tree);
     let viewport = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1280.0, 760.0));
     let mut blocks: Vec<BenchBlock> = Vec::new();
-    collect_bench_blocks(&root, viewport.shrink(BLOCK_PAD), 0, &mut blocks);
+    collect_bench_blocks(
+        &root,
+        viewport.shrink(BLOCK_PAD),
+        0,
+        resolve_nest_gate(0.0),
+        &mut blocks,
+    );
 
     let cards = blocks
         .iter()
@@ -1654,8 +1870,17 @@ struct BenchBlock {
 
 /// Mirrors `draw_children`'s layout rules (sort, squarify, nest condition) to
 /// collect the set of blocks that would be painted, without touching a
-/// `Painter`. Spike-only.
-fn collect_bench_blocks(node: &Node, rect: Rect, depth: usize, out: &mut Vec<BenchBlock>) {
+/// `Painter`. `gate` is the render posture's resolved `NestGate` (see
+/// `resolve_nest_gate`) — the `--debug-perf` bench always passes the detail
+/// gate (`resolve_nest_gate(0.0)`) since it measures today's default posture;
+/// unit tests pass both detail and abstract gates to compare block counts.
+fn collect_bench_blocks(
+    node: &Node,
+    rect: Rect,
+    depth: usize,
+    gate: NestGate,
+    out: &mut Vec<BenchBlock>,
+) {
     if node.children.is_empty() || rect.width() < 1.0 || rect.height() < 1.0 {
         return;
     }
@@ -1674,10 +1899,10 @@ fn collect_bench_blocks(node: &Node, rect: Rect, depth: usize, out: &mut Vec<Ben
         }
         let block = Rect::from_min_size(Pos2::new(r.x, r.y), Vec2::new(r.w, r.h)).shrink(0.5);
         let nestable = child.is_dir
-            && depth < MAX_DEPTH
-            && block.area() > MIN_NEST_AREA
-            && block.width() > MIN_NEST_SIDE
-            && block.height() > MIN_NEST_SIDE + DIR_LABEL_H;
+            && depth < gate.max_depth
+            && block.area() > gate.min_area
+            && block.width() > gate.min_side
+            && block.height() > gate.min_side + DIR_LABEL_H;
         out.push(BenchBlock {
             rect: block,
             is_dir: child.is_dir,
@@ -1690,7 +1915,7 @@ fn collect_bench_blocks(node: &Node, rect: Rect, depth: usize, out: &mut Vec<Ben
                 block.left_top() + Vec2::new(inset, DIR_LABEL_H + inset),
                 block.right_bottom() - Vec2::new(inset, inset),
             );
-            collect_bench_blocks(child, inner, depth + 1, out);
+            collect_bench_blocks(child, inner, depth + 1, gate, out);
         }
     }
 }
@@ -1883,6 +2108,140 @@ fn synth_all_cards_tree() -> Entry {
         size,
         is_dir: true,
         children,
+    }
+}
+
+#[cfg(test)]
+mod abstraction_tests {
+    use super::*;
+
+    #[test]
+    fn detail_end_matches_todays_constants_exactly() {
+        let gate = resolve_nest_gate(0.0);
+        assert_eq!(gate.max_depth, MAX_DEPTH);
+        assert_eq!(gate.min_side, MIN_NEST_SIDE);
+        assert_eq!(gate.min_area, MIN_NEST_AREA);
+    }
+
+    #[test]
+    fn abstract_end_drops_depth_to_the_floor_and_scales_size_up() {
+        let gate = resolve_nest_gate(1.0);
+        assert_eq!(gate.max_depth, 1, "full abstract must cap depth at its floor of 1");
+        assert_eq!(gate.min_side, MIN_NEST_SIDE * (1.0 + ABSTRACTION_SIDE_GAIN));
+        assert_eq!(
+            gate.min_area,
+            MIN_NEST_AREA * (1.0 + ABSTRACTION_SIDE_GAIN) * (1.0 + ABSTRACTION_SIDE_GAIN)
+        );
+    }
+
+    #[test]
+    fn depth_and_size_thresholds_move_monotonically_toward_abstract() {
+        let steps = [0.0, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 1.0];
+        let gates: Vec<NestGate> = steps.iter().map(|&a| resolve_nest_gate(a)).collect();
+        for pair in gates.windows(2) {
+            assert!(
+                pair[1].max_depth <= pair[0].max_depth,
+                "depth cap must never rise as abstraction increases"
+            );
+            assert!(
+                pair[1].min_side >= pair[0].min_side,
+                "size threshold must never fall as abstraction increases"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_abstraction_is_clamped() {
+        assert_eq!(resolve_nest_gate(-1.0), resolve_nest_gate(0.0));
+        assert_eq!(resolve_nest_gate(2.0), resolve_nest_gate(1.0));
+    }
+
+    /// Builds `chains` top-level directories, each a single-child chain
+    /// `chainN/lvl0/lvl1/.../lvl{chain_len-1}/leaf.bin`, every leaf the same
+    /// size. Single-child directories always get ~the full parent rect from
+    /// `squarify` (nothing to split against), so the block stays large enough
+    /// to clear the pixel-size gate for many levels regardless of viewport —
+    /// isolating the depth cap as the only thing that can stop nesting, which
+    /// is exactly what the tests below need to exercise.
+    fn build_chain_tree(chains: usize, chain_len: usize) -> Node {
+        let mut root = Node::new("root".to_string(), PathBuf::from("root"), 0, true);
+        for c in 0..chains {
+            let mut rel = PathBuf::new();
+            rel.push(format!("chain{c}"));
+            for lvl in 0..chain_len {
+                rel.push(format!("lvl{lvl}"));
+            }
+            rel.push("leaf.bin");
+            root.insert(&rel, 10_000_000, false);
+        }
+        root
+    }
+
+    /// Core block-count check for the abstraction mechanism (tasks.md 4.1):
+    /// the same nested tree renders strictly fewer visible blocks, and
+    /// strictly fewer directories expand into their children, under the
+    /// abstract posture than under detail.
+    #[test]
+    fn abstract_posture_renders_fewer_blocks_than_detail_on_the_same_tree() {
+        let root = build_chain_tree(2, 6);
+        let viewport = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1280.0, 760.0));
+
+        let mut detail_blocks = Vec::new();
+        collect_bench_blocks(
+            &root,
+            viewport.shrink(BLOCK_PAD),
+            0,
+            resolve_nest_gate(0.0),
+            &mut detail_blocks,
+        );
+
+        let mut abstract_blocks = Vec::new();
+        collect_bench_blocks(
+            &root,
+            viewport.shrink(BLOCK_PAD),
+            0,
+            resolve_nest_gate(1.0),
+            &mut abstract_blocks,
+        );
+
+        let nestable_count = |blocks: &[BenchBlock]| blocks.iter().filter(|b| b.nestable).count();
+
+        assert!(
+            abstract_blocks.len() < detail_blocks.len(),
+            "abstract ({}) should render fewer total blocks than detail ({})",
+            abstract_blocks.len(),
+            detail_blocks.len()
+        );
+        assert!(
+            nestable_count(&abstract_blocks) < nestable_count(&detail_blocks),
+            "abstract should expand fewer directories into their children than detail"
+        );
+        // Detail recurses through Program Files/App/sub down to individual
+        // res*.bin files, so it must reach the depth-4 file level; abstract's
+        // depth-1 cap must not.
+        assert!(detail_blocks.iter().any(|b| b.depth >= 3));
+        assert!(abstract_blocks.iter().all(|b| b.depth <= 1));
+    }
+
+    #[test]
+    fn abstract_posture_still_shows_at_least_the_top_level_blocks() {
+        let root = build_chain_tree(2, 6);
+        let viewport = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1280.0, 760.0));
+
+        let mut abstract_blocks = Vec::new();
+        collect_bench_blocks(
+            &root,
+            viewport.shrink(BLOCK_PAD),
+            0,
+            resolve_nest_gate(1.0),
+            &mut abstract_blocks,
+        );
+
+        // The root's direct children (both chains) must still all be present
+        // as blocks — abstraction hides *interior* structure, never the top
+        // level itself.
+        let top_level = abstract_blocks.iter().filter(|b| b.depth == 0).count();
+        assert_eq!(top_level, root.children.len());
     }
 }
 
