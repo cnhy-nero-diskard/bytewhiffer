@@ -24,6 +24,12 @@ This document is a first-pass sketch from an explore session, not a locked desig
 
 **Preview never touches `self.focus`.** The preview is computed and rendered as an overlay keyed off the currently-hovered `HitRect`, entirely separate from the `focus`/breadcrumb trail state that click-to-drill mutates. This keeps the existing `treemap-navigation` click contract untouched — abstract mode only changes what's visible before a click, never what a click does.
 
+**Abstraction mechanism: a manual slider that scales the existing pixel-size gate, not a new cutoff or aggregate-block scheme.** TLDR: `MIN_NEST_AREA`/`MIN_NEST_SIDE` become slider-scaled instead of fixed constants — detail end of the slider is today's exact defaults, abstract end raises the thresholds so more blocks fail the nest-worthy check and render flat. No new depth math, no synthetic aggregate node. This is a deliberate rejection of both the depth-cutoff and top-K+aggregate-remainder candidates from the Open Questions below: depth cutoffs and raised size thresholds only help deeply-nested trees, and top-K+aggregate is real new machinery (a synthetic node type) that solves a different problem (a single flat directory with hundreds of same-level files) — worth doing later as its own change, not conflated with this one. The slider composes with the geometry gate rather than replacing it, since it *is* the geometry gate, just user-adjustable.
+
+**Manual only, no auto-trigger.** The slider is a chrome control the user drags; there is no density-based auto-engage (unlike `render_dense`'s auto tier). Keeps the control's behavior fully predictable — moving the slider is the only thing that changes block count.
+
+**Preview is inset, never a floating overlay.** The peek-preview renders a squarify of the hovered block's children entirely within that block's own rect. No content escapes the collapsed block's bounds. This matches SpaceSniffer's own visual language — its treemap never draws outside a rectangle's own geometry, only tooltips float — and it sidesteps the z-order/clipping work a bounds-exceeding overlay would need against neighboring blocks. Trade-off accepted: a very small collapsed block gets a cramped, less legible preview; that's judged acceptable since the preview is a hint, not a replacement for drilling in.
+
 ## Risks / Trade-offs
 
 - [Peek-preview requires computing a live `squarify` on hover, potentially every frame the pointer sits over a new block] → Mitigate the same way `refresh_density`/`refresh_insights` already do: key the computed layout on `(hovered path, tree_rev)` and cache it, so it's recomputed only when the hovered block or the tree changes, not per frame.
@@ -32,7 +38,11 @@ This document is a first-pass sketch from an explore session, not a locked desig
 
 ## Open Questions
 
-- **Which abstraction mechanism reduces block count?** Candidates: (a) a shallower user-adjustable depth cutoff, (b) user-adjustable size thresholds (raising today's `MIN_NEST_AREA`/`MIN_NEST_SIDE`), (c) top-K children shown per directory with the remainder folded into a synthetic aggregate block. (a) and (b) only help deeply-nested trees; (c) is the one that helps a single flat directory with hundreds of same-level files (e.g. a DLL-heavy system dir) — need to confirm which scenario is actually motivating this before picking.
-- **Manual toggle or auto-triggered?** Whether detail/abstract is a posture the user explicitly sets (e.g. a chrome control), or auto-engages past a density threshold (mirroring `render_dense`'s existing auto-trigger) with manual override on top.
-- **Does the posture control replace the existing pixel-geometry gate, or layer on top of it?** i.e. is "detail mode" just today's `MIN_NEST_AREA`/`MIN_NEST_SIDE`/`MAX_DEPTH` values, with "abstract mode" a different set of the same constants — or is abstraction a logically separate cutoff applied after the geometry gate already decided a block *could* nest?
-- **Preview visual treatment**: inset within the collapsed block's own rect, or a floating overlay that can exceed the block's bounds (more legible for a small block, but needs z-order/clipping work against neighboring blocks)?
+Resolved (see Decisions above):
+- ~~Which abstraction mechanism reduces block count?~~ → (b), made user-adjustable via a manual slider, rather than a new depth cutoff or top-K+aggregate scheme. The top-K+aggregate case (flat DLL-heavy directories) is deferred to a future change.
+- ~~Manual toggle or auto-triggered?~~ → Manual only, no density-based auto-engage.
+- ~~Does the posture control replace the existing pixel-geometry gate, or layer on top of it?~~ → Layers on top — the slider scales `MIN_NEST_AREA`/`MIN_NEST_SIDE` directly rather than introducing a separate cutoff.
+
+- ~~Preview visual treatment~~ → Inset within the collapsed block's own rect, never a floating overlay.
+
+All open questions resolved.

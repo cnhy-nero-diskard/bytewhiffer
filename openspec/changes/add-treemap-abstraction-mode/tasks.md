@@ -1,16 +1,16 @@
 ## 1. Resolve open design questions
 
-- [ ] 1.1 Decide the abstraction mechanism (depth cutoff vs. size threshold vs. top-K+aggregate-remainder) based on which scenario is actually motivating this — a deeply nested tree, or a single flat directory with hundreds of same-level files
-- [ ] 1.2 Decide whether the render posture is a manual toggle, auto-triggered by density (like `render_dense`), or both
-- [ ] 1.3 Decide whether the posture control replaces or layers on top of the existing `MIN_NEST_AREA`/`MIN_NEST_SIDE`/`MAX_DEPTH` gate
-- [ ] 1.4 Decide the preview's visual treatment (inset within the block vs. floating overlay that can exceed block bounds)
-- [ ] 1.5 Update `design.md` and the specs in this change to reflect the resolved decisions before continuing
+- [x] 1.1 Decide the abstraction mechanism — a manual slider scaling the existing `MIN_NEST_AREA`/`MIN_NEST_SIDE` gate; top-K+aggregate-remainder deferred to a future change
+- [x] 1.2 Decide whether the render posture is a manual toggle, auto-triggered by density (like `render_dense`), or both — manual only, no auto-trigger
+- [x] 1.3 Decide whether the posture control replaces or layers on top of the existing `MIN_NEST_AREA`/`MIN_NEST_SIDE`/`MAX_DEPTH` gate — layers on top; the slider scales the existing constants directly
+- [x] 1.4 Decide the preview's visual treatment — inset within the collapsed block's own rect, never a floating overlay
+- [x] 1.5 Update `design.md` and the specs in this change to reflect the resolved decisions before continuing — design.md updated; delta specs already sit at the requirement level and need no changes for these implementation-level decisions
 
 ## 2. Render posture state and control
 
-- [ ] 2.1 Add render posture state to `BytewhifferApp` (detail/abstract, or a continuous slider — per 1.2/1.3) alongside the existing `render_dense`/`density_key` fields
-- [ ] 2.2 Add the UI control for setting the posture (chrome toggle or slider) per the decision in 1.2
-- [ ] 2.3 Wire the chosen abstraction mechanism (1.1) into `draw_children`'s collapse/recurse decision, composed with the existing pixel-size gate per the decision in 1.3
+- [ ] 2.1 Add a render posture slider field to `BytewhifferApp` (scales `MIN_NEST_AREA`/`MIN_NEST_SIDE`) alongside the existing `render_dense`/`density_key` fields
+- [ ] 2.2 Add a chrome slider control for setting the posture
+- [ ] 2.3 Wire the slider's scale factor into `draw_children`'s collapse/recurse decision, multiplying the existing `MIN_NEST_AREA`/`MIN_NEST_SIDE` pixel-size gate
 
 ## 3. Hover preview
 
