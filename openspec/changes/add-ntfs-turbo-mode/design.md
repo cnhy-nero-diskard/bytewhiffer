@@ -1,0 +1,134 @@
+## Context
+
+`scanner::ScanEngine` (`src/scanner/mod.rs`) already exists as a trait
+boundary specifically for a second engine: `Availability` has
+`RequiresElevation` and `UnsupportedFilesystem` variants that are
+`#[allow(dead_code)]`-marked because nothing constructs them yet, and
+`ScanError::Unavailable(Availability)` is similarly unconstructed. `app.rs`'s
+orchestration layer only ever drives `WalkerEngine` today.
+
+This design adds `MftEngine`, a second `ScanEngine` that reads a volume's
+`$MFT` directly (the technique WizTree uses), and the toolbar/elevation flow
+that makes it opt-in. Manual benchmarking (this repo, 2026-07-18) showed the
+walker already lands within 1.5–2s of WizTree on drives that finish in
+single-digit seconds either way — the case for `MftEngine` rests on that gap
+widening on larger/higher-file-count volumes, not on the benchmarked drives
+themselves.
+
+## Goals / Non-Goals
+
+**Goals:**
+- A second `ScanEngine` implementation that reads NTFS's `$MFT` in one
+  sequential I/O pass, parses records in parallel, and reconstructs the same
+  `Entry` tree shape the walker produces, sorted largest-first.
+- A Turbo toggle with three states (greyed out / promptable / warning-red)
+  driven entirely by `Availability`, with a WizTree-style warn-then-UAC
+  elevation flow.
+- Elevation is opt-in per click and, once granted, holds for the rest of
+  that elevated process's lifetime — no repeat UAC prompts.
+
+**Non-Goals:**
+- Preserving deep navigation state (breadcrumb, focus, abstraction slider
+  position) across the UAC relaunch. Explicitly a clean slate: the new
+  elevated process starts fresh at the same scan root.
+- Persisting the "user accepted turbo" choice across separate app launches
+  (a config file remembering elevation preference). Out of scope for this
+  change — see Open Questions.
+- Manifest-level (always-elevated) admin requests. Rejected earlier in favor
+  of the opt-in flow this design describes.
+- Network shares, non-local volumes, or any non-NTFS filesystem. These
+  always report `UnsupportedFilesystem` and use the walker.
+
+## Decisions
+
+**Flat single-pass + parallel record parse + serial rollup, not a
+directory-index-driven recursive walk.** The `ntfs` crate's
+`NtfsFile::directory_index()` would let `MftEngine` recurse the same shape
+as `WalkerEngine` (directory by directory), but that only removes
+filesystem-layer call overhead — it doesn't reach WizTree-tier speed,
+because it's still scattered reads following tree shape rather than one
+sequential sweep. WizTree's actual advantage is reading the `$MFT` as one
+linear I/O stream. Since fixed-size MFT records are independently
+parseable, that stream can be chunked and parsed with rayon, then rolled up
+bottom-up (parent file-reference → children map, sum sizes) in a single
+cheap in-memory pass. The sequential read itself is the floor and is not
+parallelizable; parsing is.
+
+**Use the `ntfs` crate for record/attribute-level parsing, not its
+traversal APIs.** Hand-rolling `$STANDARD_INFORMATION`/`$FILE_NAME`/`$DATA`
+attribute parsing (resident vs. non-resident, attribute headers) is exactly
+the kind of fiddly, well-specified binary format work a maintained crate
+already covers correctly. What's hand-built on top is the flat-pass
+iteration and the parent-child reconstruction, since the crate's
+convenience APIs assume directory-by-directory traversal.
+
+**Elevation via self-relaunch (`ShellExecuteExW`, verb `"runas"`), not a
+manifest-level `requireAdministrator`.** Keeps the default (unelevated)
+launch path — including the existing `--debug-screenshot*` / `--debug-perf`
+scriptable verification flags — unaffected. Only clicking Turbo pays the
+UAC cost. The current scan root is passed to the relaunched process as a
+CLI argument (same pattern as the existing hidden debug flags), and the old
+process exits once the new elevated one spawns.
+
+**`is_available` distinguishes not-elevated from wrong-filesystem, and the
+orchestration layer maps that directly to toggle color — no new
+`Availability` variants needed.** `MftEngine::is_available(target)`: checks
+the target volume's filesystem first (not NTFS → `UnsupportedFilesystem`,
+greys the toggle out); if NTFS, checks the process token for elevation (not
+elevated → `RequiresElevation`, toggle is clickable and warns before UAC;
+elevated → `Available`, toggle just runs turbo). Re-run on every scan-root
+change so switching to a non-NTFS target after elevation correctly flips
+the toggle to warning-red rather than staying green.
+
+**Turbo-on state lives in-memory on the elevated process for its lifetime,
+not on disk.** "Permanently toggled on after first UAC" is scoped to that
+elevated process's session; a fresh launch starts unelevated and
+unprompted again. Simpler, and avoids a new persisted-settings surface for
+this change.
+
+## Risks / Trade-offs
+
+- **Live filesystem changes during a `$MFT` read produce a snapshot with
+  eventual-consistency artifacts** (a file deleted/moved mid-scan may be
+  stale or briefly double-represented). → Same accepted limitation WizTree
+  has; not something Bytewhiffer can fully close either. Not a regression
+  versus the walker's own mid-scan mutation exposure.
+- **Hard links, reparse points/junctions, and deleted-but-unreclaimed MFT
+  records can double-count size or produce ghost entries** if not
+  explicitly handled (`hard_link_count()` and reparse/deletion flags need
+  explicit checks; the crate does not dedupe or filter these for you). →
+  Cross-check `MftEngine` output against `WalkerEngine` output for the same
+  tree during development as a correctness oracle; explicit unit tests for
+  each case using synthetic record layouts.
+- **The UAC relaunch discards in-flight state** (deep navigation,
+  abstraction slider). → Accepted per Non-Goals; if this proves jarring in
+  practice, revisit passing more than just the scan root.
+- **Raw volume access + a self-elevating relaunch can read as suspicious to
+  antivirus/EDR software.** → No mitigation planned for this change; flag if
+  it surfaces during real-hardware testing.
+- **Nothing in `MftEngine`'s raw-volume-access, elevation, or real-disk-speed
+  behavior can be exercised from this development environment** (WSL, no
+  admin token, no raw NTFS access). → Parsing/reconstruction logic stays
+  pure and unit-testable against synthetic `$MFT` byte layouts (mirroring
+  how `scanner/`/`treemap.rs` stay engine-agnostic and display-free); the
+  raw-access/elevation/speed parts are verified by a human on real Windows
+  hardware via an elevated PowerShell session, the same closing-the-loop
+  pattern the existing `--debug-perf` flag already relies on.
+
+## Migration Plan
+
+Purely additive: a new engine and a new toggle, both inert until a user
+clicks Turbo. No data migration, no change to default launch behavior, no
+feature flag needed beyond the toggle itself. Rollback is deleting the
+toggle/engine wiring; nothing downstream depends on `MftEngine` existing.
+
+## Open Questions
+
+- Should "turbo accepted" persist across separate app launches (a small
+  config file), so a user doesn't re-approve UAC every time they open
+  Bytewhiffer on the same machine? Left as in-memory/per-launch for this
+  change; revisit if that friction turns out to matter in practice.
+- Exact Windows API for the elevation check backing `RequiresElevation`
+  (e.g. checking the process token's elevation type) needs to be nailed
+  down during implementation — noted here rather than in Decisions since
+  it's a lookup, not a trade-off.
