@@ -205,8 +205,8 @@ impl Node {
 /// elevated. Drives both the toggle's look and what a click does.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TurboState {
-    /// No target yet, or a non-NTFS target on an unelevated process — greyed
-    /// out, clicking does nothing.
+    /// A non-NTFS target on an unelevated process — greyed out, clicking does
+    /// nothing.
     Disabled,
     /// NTFS target, not yet elevated — clicking begins the warn-then-UAC flow.
     Promptable,
@@ -410,10 +410,11 @@ pub struct BytewhifferApp {
     /// Render posture: 0.0 = detail (today's full nesting), rising toward 1.0 =
     /// abstract (fewer, larger blocks). Drives the frame's `NestGate` — a depth
     /// cap dropping toward 1 plus a rising size threshold — so branches collapse
-    /// after fewer levels and small blocks fold away. Manual only: the user
-    /// drags the toolbar slider; there is no density-based auto-engage. Defaults
-    /// to 0.0 via `derive(Default)`, the detail end, preserving prior behavior.
-    /// See `BytewhifferApp::nest_gate`.
+    /// after fewer levels and small blocks fold away. Manual: the user drags the
+    /// toolbar slider; there is no density-based auto-engage. `derive(Default)`
+    /// would put this at 0.0, so every constructor below explicitly starts it at
+    /// `1.0` (max abstraction) instead — the app opens on the collapsed overview
+    /// rather than full detail. See `BytewhifferApp::nest_gate`.
     abstraction: f32,
     /// Cached hover-preview overlay for the collapsed directory block under
     /// the pointer in abstract mode; `None` when nothing eligible is hovered.
@@ -426,8 +427,9 @@ pub struct BytewhifferApp {
     /// spec's "stays on for the elevated process's lifetime" requirement.
     turbo_elevated: bool,
     /// The MFT turbo engine's capability for the current scan target, recomputed
-    /// on every scan start (i.e. every target change). `None` before any scan.
-    /// Drives `turbo_state`.
+    /// on every scan start (i.e. every target change). `None` before any scan —
+    /// `turbo_state` treats that as "assume NTFS" rather than checking eagerly,
+    /// so the toggle isn't greyed out before a target even exists.
     turbo_availability: Option<Availability>,
     /// A scan root the elevated self-relaunch asked us to resume. Started on the
     /// first frame (scanning needs the running app), then cleared. Clean slate:
@@ -447,6 +449,7 @@ impl BytewhifferApp {
     pub fn new() -> Self {
         Self {
             turbo_elevated: mft::process_is_elevated(),
+            abstraction: 1.0,
             ..Self::default()
         }
     }
@@ -455,6 +458,7 @@ impl BytewhifferApp {
         Self {
             debug_shot: Some(shot),
             turbo_elevated: mft::process_is_elevated(),
+            abstraction: 1.0,
             ..Self::default()
         }
     }
@@ -466,6 +470,7 @@ impl BytewhifferApp {
         Self {
             pending_scan: Some(root),
             turbo_elevated: mft::process_is_elevated(),
+            abstraction: 1.0,
             ..Self::default()
         }
     }
@@ -695,7 +700,25 @@ impl BytewhifferApp {
             let resp = turbo_toggle(ui, label, state).on_hover_text(hover);
             if resp.clicked() {
                 match state {
-                    TurboState::Promptable => self.turbo_warning_open = true,
+                    TurboState::Promptable => {
+                        // No target yet (nothing scanned, nothing typed): let the
+                        // click double as picking a folder instead of dead-ending
+                        // in a "pick a folder first" error once the warning
+                        // dialog is confirmed. Deliberately do NOT kick off a
+                        // walker scan here — the elevated relaunch is about to do
+                        // the real MFT scan, so a throwaway scan (and closing the
+                        // window mid-scan to relaunch) would just be jank. Only
+                        // record the chosen path so `trigger_elevation` can pass
+                        // it through, then open the warning dialog.
+                        if self.last_scanned_path.is_none() && self.path_input.trim().is_empty() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                self.path_input = folder.to_string_lossy().into_owned();
+                                self.turbo_warning_open = true;
+                            }
+                        } else {
+                            self.turbo_warning_open = true;
+                        }
+                    }
                     TurboState::WarnUnsupported => self.turbo_unsupported_open = true,
                     // Disabled never senses clicks; Active is already on.
                     TurboState::Disabled | TurboState::Active => {}
@@ -1267,7 +1290,13 @@ impl BytewhifferApp {
     /// [`TurboState`].
     fn turbo_state(&self) -> TurboState {
         match self.turbo_availability {
-            None => TurboState::Disabled,
+            // No scan has run yet, so the NTFS check hasn't happened at all —
+            // assume the common case (NTFS) rather than greying the toggle out
+            // pre-emptively. `start_scan` re-derives the real availability on
+            // the first scan and flips this to `WarnUnsupported`/`Disabled` if
+            // the target turns out not to be NTFS.
+            None if self.turbo_elevated => TurboState::Active,
+            None => TurboState::Promptable,
             Some(Availability::Available) => TurboState::Active,
             Some(Availability::RequiresElevation) => TurboState::Promptable,
             Some(Availability::UnsupportedFilesystem) | Some(Availability::NotApplicable) => {

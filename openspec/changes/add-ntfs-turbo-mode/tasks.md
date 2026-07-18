@@ -68,7 +68,14 @@
       caught and fixed one real bug: SHELLEXECUTEINFOW carries an HKEY field,
       so windows-rs gates the whole ShellExecuteExW/SHELLEXECUTEINFOW pair
       behind the unrelated-sounding `Win32_System_Registry` feature. See
-      CLAUDE.md's "Verifying #[cfg(windows)] code" note. -->
+      CLAUDE.md's "Verifying #[cfg(windows)] code" note.
+      Post-implementation fix (2026-07-18): the scan root was passed as
+      `"{}"` around `Path::display()`, so a drive root like `D:\` became
+      `"D:\"` — whose trailing `\"` CommandLineToArgvW reads as an escaped
+      quote, delivering `D:"` to the elevated process. Now quoted via the
+      pure, unit-tested `quote_windows_arg` (doubles backslash runs before
+      the closing quote per the Windows rules), with a round-trip test
+      (`quote_windows_arg_round_trips_drive_roots_and_paths`). -->
 - [x] 5.2 Add CLI argument parsing in `main.rs` for the relaunched process to
       pick up and resume scanning that root (same pattern as the existing
       hidden `--debug-screenshot*` flags)
@@ -84,9 +91,26 @@
 - [x] 6.2 Render the three visual states: disabled/greyed out
       (`UnsupportedFilesystem`), promptable (`RequiresElevation`), active
       (`Available`)
-      <!-- Plus a fourth warning-red state for elevated + non-NTFS (task 6.4). -->
+      <!-- Plus a fourth warning-red state for elevated + non-NTFS (task 6.4).
+      Post-implementation fix (2026-07-18): `turbo_state`'s pre-scan `None`
+      case originally mapped to Disabled, greying the toggle out before a
+      target was even chosen. Fixed to assume NTFS until a real capability
+      check says otherwise (Active if already elevated, else Promptable) —
+      see the turbo-mode spec's new "No scan yet does not disable the
+      toggle" scenario. -->
 - [x] 6.3 Implement the warning dialog shown before triggering UAC, gated on
       user confirmation
+      <!-- Post-implementation fix (2026-07-18): once the toggle could be
+      Promptable with no scan target yet (task 6.2's fix), clicking it went
+      warning-dialog -> confirm -> UAC -> `trigger_elevation`'s "pick a folder
+      first" error, a dead end. Fixed: clicking Promptable with no target
+      (nothing scanned, nothing typed) opens the folder picker first, records
+      the chosen path (into `path_input`, which `trigger_elevation` already
+      reads), and shows the warning dialog. Deliberately does NOT start a
+      walker scan — the elevated relaunch does the one real MFT scan, so a
+      throwaway scan + closing the window mid-scan to relaunch would be jank.
+      See the turbo-mode spec's new "Clicking a promptable toggle with no
+      target picks a folder first" scenario. -->
 - [x] 6.4 Implement the "turbo does not work for this drive" warning dialog
       and red toggle state for an already-elevated process whose target is
       non-NTFS

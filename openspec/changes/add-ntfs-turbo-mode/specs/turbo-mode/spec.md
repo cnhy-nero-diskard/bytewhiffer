@@ -5,6 +5,17 @@ The system SHALL render a Turbo toggle in the toolbar whose visual state
 tracks the MFT engine's capability check for the current scan target:
 disabled/greyed out when unavailable due to filesystem, normal/promptable
 when available but requiring elevation, and active when already elevated.
+Before any scan has run — so no capability check has happened yet — the
+toggle SHALL NOT render disabled; it assumes the common case (an NTFS
+target) and renders promptable, or active if the process is already
+elevated. The toggle only becomes disabled/greyed out once a scan target is
+actually checked and found not to be NTFS.
+
+#### Scenario: No scan yet does not disable the toggle
+- **WHEN** the application has just started and no scan target has been
+  chosen, so the capability check has not run
+- **THEN** the Turbo toggle renders promptable (or active, if the process is
+  already elevated) rather than disabled/greyed out
 
 #### Scenario: Non-NTFS target disables the toggle
 - **WHEN** the current scan target's capability check reports
@@ -31,10 +42,21 @@ intermediate confirmation.
 
 #### Scenario: Clicking a promptable toggle shows the warning first
 - **WHEN** the user clicks the Turbo toggle while it is in its promptable
-  (not yet elevated) state
+  (not yet elevated) state, and a scan target already exists (something has
+  been scanned or typed into the path field)
 - **THEN** a warning dialog appears explaining the administrator
   requirement, and the OS elevation prompt is not triggered until the user
   confirms that dialog
+
+#### Scenario: Clicking a promptable toggle with no target picks a folder first
+- **WHEN** the user clicks the Turbo toggle while it is in its promptable
+  state and no scan target exists yet (nothing scanned, nothing typed into
+  the path field)
+- **THEN** a folder picker opens; if the user picks a folder, that folder is
+  recorded as the elevation root and the warning dialog appears, and no scan
+  is started before elevation (the elevated relaunch performs the one real
+  scan — no throwaway walker scan and no closing the window mid-scan); if the
+  user cancels the picker, nothing else happens and no error is shown
 
 #### Scenario: Dismissing the warning dialog does not elevate
 - **WHEN** the user dismisses or cancels the warning dialog instead of

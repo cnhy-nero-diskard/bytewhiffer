@@ -715,6 +715,46 @@ pub fn relaunch_elevated(scan_root: &Path) -> std::io::Result<bool> {
     platform::relaunch_elevated(scan_root)
 }
 
+/// Wraps `arg` in double quotes for a Windows command line, following the
+/// `CommandLineToArgvW` backslash/quote rules so the value round-trips through
+/// `std::env::args` in the relaunched process unchanged. The rule that bites
+/// here: a run of backslashes immediately before a closing quote must be
+/// doubled, otherwise `\"` reads as an escaped literal quote. A drive root like
+/// `D:\` naively quoted as `"D:\"` would arrive as `D:"`; this yields `"D:\\"`,
+/// which arrives as `D:\`. Pure and testable on any host.
+pub fn quote_windows_arg(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut pending_backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => pending_backslashes += 1,
+            '"' => {
+                // Escape every backslash run that precedes a quote, then the
+                // quote itself.
+                for _ in 0..(pending_backslashes * 2 + 1) {
+                    out.push('\\');
+                }
+                pending_backslashes = 0;
+                out.push('"');
+            }
+            _ => {
+                for _ in 0..pending_backslashes {
+                    out.push('\\');
+                }
+                pending_backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    // Double any trailing backslashes so they don't escape the closing quote.
+    for _ in 0..(pending_backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Platform layer
 // ---------------------------------------------------------------------------
@@ -816,8 +856,13 @@ mod platform {
         let exe = std::env::current_exe()?;
         let exe_w = wide(&exe.to_string_lossy());
         // `--elevated-scan <root>` is the hidden flag main.rs parses to resume
-        // scanning the same root in the fresh elevated process.
-        let params = format!("--elevated-scan \"{}\"", scan_root.display());
+        // scanning the same root in the fresh elevated process. The root is
+        // quoted per the Windows `CommandLineToArgvW` rules so a drive root like
+        // `D:\` survives the round-trip instead of arriving as `D:"`.
+        let params = format!(
+            "--elevated-scan {}",
+            super::quote_windows_arg(&scan_root.to_string_lossy())
+        );
         let params_w = wide(&params);
         let verb_w = wide("runas");
 
@@ -1492,5 +1537,64 @@ mod tests {
             Availability::RequiresElevation
         );
         assert_eq!(resolve_availability(true, true), Availability::Available);
+    }
+
+    /// Emulates the `CommandLineToArgvW` unquoting the relaunched process's
+    /// `std::env::args` performs, so we can assert `quote_windows_arg` round-
+    /// trips. Only handles the double-quoted single-argument case we produce.
+    fn unquote_windows_arg(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.first(), Some(&'"'), "must start quoted");
+        let mut out = String::new();
+        let mut backslashes = 0usize;
+        for &c in &chars[1..] {
+            match c {
+                '\\' => backslashes += 1,
+                '"' => {
+                    // n backslashes then a quote: floor(n/2) literal
+                    // backslashes, then an odd count escapes a literal quote
+                    // while an even count marks the closing delimiter.
+                    for _ in 0..(backslashes / 2) {
+                        out.push('\\');
+                    }
+                    if backslashes % 2 == 1 {
+                        out.push('"');
+                        backslashes = 0;
+                    } else {
+                        break; // closing quote
+                    }
+                }
+                _ => {
+                    for _ in 0..backslashes {
+                        out.push('\\');
+                    }
+                    backslashes = 0;
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn quote_windows_arg_round_trips_drive_roots_and_paths() {
+        for original in [
+            r"D:\",
+            r"C:\",
+            r"C:\Users\me\Documents",
+            r"C:\path with spaces\",
+            r#"C:\weird"name\"#,
+            r"D:\trailing\\",
+            "plain",
+        ] {
+            let quoted = quote_windows_arg(original);
+            assert_eq!(
+                unquote_windows_arg(&quoted),
+                original,
+                "quoting of {original:?} produced {quoted:?}, which did not round-trip"
+            );
+        }
+        // The specific bug this guards: `D:\` must not degrade to `D:"`.
+        assert_eq!(quote_windows_arg(r"D:\"), r#""D:\\""#);
     }
 }
