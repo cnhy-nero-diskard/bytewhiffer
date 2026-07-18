@@ -523,6 +523,7 @@ dependencies = [
  "rayon",
  "rfd",
  "trash",
+ "windows 0.62.2",
 ]
 
 [[package]]

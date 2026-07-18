@@ -20,10 +20,13 @@ pain points: it's slow, and it looks like a 2010-era Win32 app.
   files/folders leaderboard, small-file-blizzard and known-junk flags
 - Abstraction slider — collapse the map to fewer, bigger top-level blocks;
   hover a collapsed block for a non-committal preview of its contents
+- Turbo mode — an opt-in NTFS `$MFT`-reading scan engine (the technique
+  WizTree uses) for a much faster scan of large local NTFS drives; a toolbar
+  toggle explains the administrator requirement, then elevates via UAC
 
 See [rust-space-sniffer-overview.md](rust-space-sniffer-overview.md) for the
 full design rationale, tech stack decisions, and planned V2 work (filtering,
-tagging, export, NTFS MFT "turbo mode" scanning).
+tagging, export).
 
 ## Requirements
 
@@ -89,6 +92,9 @@ src/
   scanner/
     mod.rs       — Entry tree type, ScanEngine trait, ScanContext, progress counters
     walker.rs    — parallel (rayon) directory-walk ScanEngine implementation
+    mft.rs       — NTFS $MFT-reading "turbo" ScanEngine: pure record parser +
+                   tree reconstruction (cross-platform, unit-tested), with the
+                   raw-volume/elevation/relaunch surface gated to Windows
   treemap.rs     — pure squarified-treemap layout algorithm (Bruls/Huizing/van Wijk 1999)
   theme.rs       — color palette + deterministic hash-derived color-from-extension logic
   insights.rs    — pure, egui-free derived analytics (legend, leaderboard, blizzard/junk flags)
@@ -99,7 +105,7 @@ src/
 
 ### ScanEngine abstraction
 
-Every scanning backend implements the `ScanEngine` trait: `name()`, `is_available()`, and `scan()`. Currently only `WalkerEngine` (parallel `read_dir` recursion via rayon) exists, but the trait is designed for a v2 NTFS MFT-reading engine (requires elevation, local NTFS only). Scans run on a background thread. `ScanContext` carries a cancellation flag, atomic `ScanProgress` counters, and an optional `mpsc::Sender<ScanEvent>` for live discovery — the walker streams `ScanEvent::Discovered` per entry so the UI grows the map while scanning. The authoritative result is always the final `Entry` tree returned by `scan()`, never the event stream.
+Every scanning backend implements the `ScanEngine` trait: `name()`, `is_available()`, and `scan()`. `WalkerEngine` (parallel `read_dir` recursion via rayon) is the universal fallback that works on any drive without elevation; `MftEngine` reads a local NTFS volume's `$MFT` directly for a faster scan but needs administrator elevation, so `is_available()` reports `Available` / `RequiresElevation` / `UnsupportedFilesystem` and `app.rs` picks the engine at a single point (elevated + NTFS → MFT, otherwise walker). Scans run on a background thread. `ScanContext` carries a cancellation flag, atomic `ScanProgress` counters, and an optional `mpsc::Sender<ScanEvent>` for live discovery — the walker streams `ScanEvent::Discovered` per entry so the UI grows the map while scanning; the MFT engine (one linear read, then a bottom-up rollup) does not stream, so its counters step to their final values once. The authoritative result is always the final `Entry` tree returned by `scan()`, never the event stream.
 
 ### Two parallel tree types
 
@@ -120,6 +126,14 @@ A toolbar slider (`0.0` detail .. `1.0` abstract) tightens the same pixel-size g
 ### Insights drawer
 
 A collapsible left-side panel (toolbar toggle, closed by default) presenting derived analytics over the currently focused subtree — extension color legend, size-by-extension breakdown, biggest-entries leaderboard, small-file-blizzard and known-junk flags. All of it is computed in `insights.rs` from the tree a scan already produced, with no new scanning cost; clicking a leaderboard entry focuses the treemap on that path via the existing navigation state.
+
+### Turbo mode (NTFS `$MFT` engine)
+
+`scanner::mft::MftEngine` reads a local NTFS volume's Master File Table in one sequential pass, parses the fixed-size records in parallel (rayon), and rolls them up bottom-up into the same `Entry` tree the walker produces — the technique WizTree uses. The record parser and tree reconstruction (boot-sector parse, Update-Sequence-Array fixups, `$STANDARD_INFORMATION`/`$FILE_NAME`/`$DATA` attributes, data-run decoding, parent→children rollup) are pure and cross-platform, and unit-tested against hand-built synthetic record layouts with no real volume required. Only raw-volume access, filesystem/elevation detection, and the UAC self-relaunch are Windows-only (`#[cfg(windows)]`).
+
+The toolbar's ⚡ Turbo toggle mirrors `MftEngine::is_available` for the current target: greyed out on a non-NTFS drive, promptable on an NTFS drive (clicking shows a warning dialog, then triggers UAC and relaunches elevated at the same scan root), active once elevated, and a red warning state if an already-elevated session points at a non-NTFS drive (which still scans via the walker fallback). Elevation is opt-in and holds for the elevated process's lifetime — it is never persisted across launches.
+
+> Turbo mode's raw-volume access, elevation, and real-disk speed can only be exercised on real Windows hardware from an elevated session; they cannot run in a non-Windows dev environment, which is why the parsing/reconstruction logic is kept pure and independently unit-testable.
 
 ## Development
 

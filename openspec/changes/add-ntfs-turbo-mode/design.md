@@ -54,13 +54,28 @@ bottom-up (parent file-reference → children map, sum sizes) in a single
 cheap in-memory pass. The sequential read itself is the floor and is not
 parallelizable; parsing is.
 
-**Use the `ntfs` crate for record/attribute-level parsing, not its
-traversal APIs.** Hand-rolling `$STANDARD_INFORMATION`/`$FILE_NAME`/`$DATA`
-attribute parsing (resident vs. non-resident, attribute headers) is exactly
-the kind of fiddly, well-specified binary format work a maintained crate
-already covers correctly. What's hand-built on top is the flat-pass
-iteration and the parent-child reconstruction, since the crate's
-convenience APIs assume directory-by-directory traversal.
+**Hand-roll the `$MFT` record/attribute parse; the `ntfs` crate can't do it.**
+The original plan was to lean on the `ntfs` crate for the fiddly
+`$STANDARD_INFORMATION`/`$FILE_NAME`/`$DATA` attribute parsing (resident vs.
+non-resident, attribute headers) and hand-build only the flat-pass iteration and
+parent-child reconstruction on top. That turned out to be impossible: the
+`ntfs` crate has **no public entry point for parsing a record out of an
+in-memory buffer** — its only record access is `Ntfs::file(fs, n)`, which reads
+each record *through the volume's own `$MFT` data runs* via a single `&mut`
+reader (`NtfsFile::new` is private). That is fundamentally incompatible with
+this engine's whole reason to exist: one sequential read of the entire `$MFT`
+into a buffer, then fixed-size records parsed **in parallel** with rayon. Using
+the crate would force scattered, volume-relative, single-threaded reads — i.e.
+abandoning the flat-buffer + parallel-parse decision above. So the minimal
+subset of the FILE-record format actually needed here is hand-rolled in
+`scanner::mft`: the FILE-record header, Update-Sequence-Array fixups, the three
+attribute types, and data-run decoding (only to locate the `$MFT`'s own
+fragments during the read). It is well-specified and small, and — importantly —
+being a pure byte-in / tree-out function it is **fully unit-testable on the
+Linux dev machine against synthetic record layouts**, which the crate's
+volume-backed API would not have been. This deepens, rather than contradicts,
+the testability note in Risks below. Decided during implementation
+(2026-07-18); the `ntfs` crate is not a dependency.
 
 **Elevation via self-relaunch (`ShellExecuteExW`, verb `"runas"`), not a
 manifest-level `requireAdministrator`.** Keeps the default (unelevated)
