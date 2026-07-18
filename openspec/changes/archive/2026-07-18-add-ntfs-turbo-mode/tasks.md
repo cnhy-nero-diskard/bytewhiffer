@@ -138,15 +138,16 @@
 > human on real Windows hardware from an elevated PowerShell session — the same
 > closing-the-loop limitation the existing `--debug-perf` flag has.
 
-- [ ] 8.1 Cross-check `MftEngine` output against `WalkerEngine` output for
-      the same real directory tree as a correctness oracle
-- [ ] 8.2 Re-run the manual WizTree-vs-Bytewhiffer benchmark with turbo mode
-      active and compare against the walker-only numbers already recorded
-      in the proposal
-- [ ] 8.3 Manually verify the full click-to-turbo flow: greyed-out state on
+- [ ] 8.1 Manually verify the full click-to-turbo flow: greyed-out state on
       a non-NTFS target, warning dialog, UAC prompt, relaunch, active state,
       and the post-elevation non-NTFS warning state
-- [ ] 8.4 Test UAC decline path end-to-end
+- [ ] 8.2 Test UAC decline path end-to-end
+
+> The `MftEngine`-vs-`WalkerEngine` correctness cross-check and the
+> WizTree-vs-turbo-mode benchmark re-run (originally 8.1/8.2 here) were moved
+> to design.md's Open Questions — deferred to whenever the planned
+> debugging-framework expansion lands, since they don't block this proposal
+> and fit naturally as that feature's first exercises.
 
 ## 9. Docs
 

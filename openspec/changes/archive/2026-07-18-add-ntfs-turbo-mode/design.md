@@ -147,3 +147,12 @@ toggle/engine wiring; nothing downstream depends on `MftEngine` existing.
   (e.g. checking the process token's elevation type) needs to be nailed
   down during implementation — noted here rather than in Decisions since
   it's a lookup, not a trade-off.
+- **Deferred, not blocking this proposal:** cross-check `MftEngine` output
+  against `WalkerEngine` output for the same real directory tree as a
+  correctness oracle, and re-run the manual WizTree-vs-Bytewhiffer benchmark
+  with turbo mode active against the walker-only numbers recorded above.
+  Both need real Windows hardware and a human, same as tasks 8.1/8.2 in
+  `tasks.md` (which now cover only the UI-flow and UAC-decline checks).
+  Earmarked for the planned future debugging-framework expansion — that
+  change should pick these two up as its first exercises rather than this
+  one re-absorbing them.
