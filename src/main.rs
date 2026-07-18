@@ -24,6 +24,15 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // Hidden flag the elevated self-relaunch passes to the fresh process:
+    // `bytewhiffer --elevated-scan <path>` starts clean at <path> with turbo
+    // already active (the new process holds the elevated token). Same
+    // pass-a-path-through-argv pattern as the debug-screenshot flags; navigation
+    // state is deliberately not restored (a clean slate — see the turbo-mode
+    // spec).
+    let elevated_scan = (args.len() == 3 && args[1] == "--elevated-scan")
+        .then(|| std::path::PathBuf::from(&args[2]));
+
     let shot_mode = |flag: &str| match flag {
         "--debug-screenshot" => Some(app::DebugShotMode::Final),
         "--debug-screenshot-live" => Some(app::DebugShotMode::Live),
@@ -53,9 +62,10 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            let app = match debug_shot {
-                Some(shot) => app::BytewhifferApp::with_debug_shot(shot),
-                None => app::BytewhifferApp::default(),
+            let app = match (debug_shot, elevated_scan) {
+                (Some(shot), _) => app::BytewhifferApp::with_debug_shot(shot),
+                (None, Some(root)) => app::BytewhifferApp::with_elevated_scan(root),
+                (None, None) => app::BytewhifferApp::new(),
             };
             Ok(Box::new(app))
         }),

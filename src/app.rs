@@ -12,7 +12,9 @@ use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, 
 
 use crate::insights;
 use crate::scanner::{
-    walker::WalkerEngine, Availability, Entry, ScanContext, ScanEngine, ScanError, ScanEvent,
+    mft::{self, MftEngine},
+    walker::WalkerEngine,
+    Availability, Entry, ScanContext, ScanEngine, ScanError, ScanEvent,
 };
 use crate::theme;
 use crate::treemap;
@@ -197,6 +199,30 @@ impl Node {
         true
     }
 }
+
+/// The Turbo toggle's rendered state, derived from the MFT engine's capability
+/// check for the current scan target plus whether this process is already
+/// elevated. Drives both the toggle's look and what a click does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurboState {
+    /// A non-NTFS target on an unelevated process — greyed out, clicking does
+    /// nothing.
+    Disabled,
+    /// NTFS target, not yet elevated — clicking begins the warn-then-UAC flow.
+    Promptable,
+    /// NTFS target on an already-elevated process — turbo is on; scans use the
+    /// MFT engine with no further prompt.
+    Active,
+    /// An already-elevated process pointed at a non-NTFS target — turbo can't
+    /// apply here; clicking explains why (the scan already used the walker).
+    WarnUnsupported,
+}
+
+/// A warning red in the GitHub-dark family, used only for the Turbo toggle's
+/// `WarnUnsupported` state (an elevated process on a non-NTFS drive). Not a
+/// general palette color — turbo is the one place a "this won't work" signal
+/// is surfaced on a control that is otherwise interactive.
+const TURBO_WARN_RED: egui::Color32 = egui::Color32::from_rgb(0xda, 0x36, 0x33);
 
 /// A scan running on a background thread, plus the channels to observe it.
 struct ActiveScan {
@@ -384,21 +410,67 @@ pub struct BytewhifferApp {
     /// Render posture: 0.0 = detail (today's full nesting), rising toward 1.0 =
     /// abstract (fewer, larger blocks). Drives the frame's `NestGate` — a depth
     /// cap dropping toward 1 plus a rising size threshold — so branches collapse
-    /// after fewer levels and small blocks fold away. Manual only: the user
-    /// drags the toolbar slider; there is no density-based auto-engage. Defaults
-    /// to 0.0 via `derive(Default)`, the detail end, preserving prior behavior.
-    /// See `BytewhifferApp::nest_gate`.
+    /// after fewer levels and small blocks fold away. Manual: the user drags the
+    /// toolbar slider; there is no density-based auto-engage. `derive(Default)`
+    /// would put this at 0.0, so every constructor below explicitly starts it at
+    /// `1.0` (max abstraction) instead — the app opens on the collapsed overview
+    /// rather than full detail. See `BytewhifferApp::nest_gate`.
     abstraction: f32,
     /// Cached hover-preview overlay for the collapsed directory block under
     /// the pointer in abstract mode; `None` when nothing eligible is hovered.
     /// Purely presentational — never touches `focus`/breadcrumb state.
     preview: Option<PreviewOverlay>,
+    /// Whether this process holds an elevated token. Detected once at startup
+    /// (the UAC self-relaunch produces such a process); once true, turbo stays
+    /// on for the rest of this process's lifetime and never re-prompts. Never
+    /// persisted — a fresh launch re-detects from scratch. See the turbo-mode
+    /// spec's "stays on for the elevated process's lifetime" requirement.
+    turbo_elevated: bool,
+    /// The MFT turbo engine's capability for the current scan target, recomputed
+    /// on every scan start (i.e. every target change). `None` before any scan —
+    /// `turbo_state` treats that as "assume NTFS" rather than checking eagerly,
+    /// so the toggle isn't greyed out before a target even exists.
+    turbo_availability: Option<Availability>,
+    /// A scan root the elevated self-relaunch asked us to resume. Started on the
+    /// first frame (scanning needs the running app), then cleared. Clean slate:
+    /// only the root carries over, not navigation state.
+    pending_scan: Option<PathBuf>,
+    /// Whether the pre-UAC "Turbo needs administrator" confirmation dialog is
+    /// open. Gates the elevation prompt on explicit user confirmation.
+    turbo_warning_open: bool,
+    /// Whether the "Turbo does not work for this drive" dialog is open (raised
+    /// when an already-elevated process's target is non-NTFS).
+    turbo_unsupported_open: bool,
 }
 
 impl BytewhifferApp {
+    /// A normal launch. Detects the process's elevation once so a user who
+    /// started Bytewhiffer from an elevated shell gets turbo without a relaunch.
+    pub fn new() -> Self {
+        Self {
+            turbo_elevated: mft::process_is_elevated(),
+            abstraction: 1.0,
+            ..Self::default()
+        }
+    }
+
     pub fn with_debug_shot(shot: DebugShot) -> Self {
         Self {
             debug_shot: Some(shot),
+            turbo_elevated: mft::process_is_elevated(),
+            abstraction: 1.0,
+            ..Self::default()
+        }
+    }
+
+    /// The elevated relaunch's landing constructor: this process is elevated and
+    /// resumes scanning `root` on the first frame, starting fresh (no restored
+    /// navigation state).
+    pub fn with_elevated_scan(root: PathBuf) -> Self {
+        Self {
+            pending_scan: Some(root),
+            turbo_elevated: mft::process_is_elevated(),
+            abstraction: 1.0,
             ..Self::default()
         }
     }
@@ -406,13 +478,30 @@ impl BytewhifferApp {
 
 impl BytewhifferApp {
     fn start_scan(&mut self, target: PathBuf) {
-        let engine = WalkerEngine;
+        // Re-derive turbo capability for this target — the spec requires the
+        // check be re-evaluated on every target change, never cached.
+        let turbo_avail = MftEngine.is_available(&target);
+        self.turbo_availability = Some(turbo_avail);
+
+        // The single engine-selection point (task 7.1): an elevated process
+        // uses the MFT turbo engine on NTFS targets and the walker everywhere
+        // else. An elevated process pointed at a non-NTFS target also raises the
+        // "turbo doesn't work here" warning rather than silently falling back.
+        let engine: Box<dyn ScanEngine> =
+            if self.turbo_elevated && turbo_avail == Availability::Available {
+                Box::new(MftEngine)
+            } else {
+                if self.turbo_elevated && turbo_avail == Availability::UnsupportedFilesystem {
+                    self.turbo_unsupported_open = true;
+                }
+                Box::new(WalkerEngine)
+            };
+
         match engine.is_available(&target) {
             Availability::Available => {}
             other => {
-                // Only one engine exists today, so a non-available report
-                // is surfaced rather than falling back; the orchestration
-                // shape is what the v2 MFT engine will slot into.
+                // The walker is always available, so this only guards a
+                // misconfigured engine choice; surface it rather than scanning.
                 self.error = Some(format!(
                     "The {} engine cannot scan this target: {:?}",
                     engine.name(),
@@ -589,6 +678,50 @@ impl BytewhifferApp {
             if chrome_button(ui, "Rescan", self.last_scanned_path.is_some()).clicked() {
                 if let Some(path) = self.last_scanned_path.clone() {
                     self.start_scan(path);
+                }
+            }
+
+            // Turbo toggle: its look and click behavior both come from
+            // `turbo_state` (greyed / promptable / active / warning-red).
+            let state = self.turbo_state();
+            let label = match state {
+                TurboState::Active => "⚡ Turbo ✓",
+                TurboState::WarnUnsupported => "⚡ Turbo ⚠",
+                _ => "⚡ Turbo",
+            };
+            let hover = match state {
+                TurboState::Disabled => {
+                    "Turbo mode needs a local NTFS drive (scan one to enable it)."
+                }
+                TurboState::Promptable => "Enable faster NTFS scanning (needs administrator).",
+                TurboState::Active => "Turbo mode is on — scanning via the NTFS Master File Table.",
+                TurboState::WarnUnsupported => "This drive isn't NTFS — turbo can't apply here.",
+            };
+            let resp = turbo_toggle(ui, label, state).on_hover_text(hover);
+            if resp.clicked() {
+                match state {
+                    TurboState::Promptable => {
+                        // No target yet (nothing scanned, nothing typed): let the
+                        // click double as picking a folder instead of dead-ending
+                        // in a "pick a folder first" error once the warning
+                        // dialog is confirmed. Deliberately do NOT kick off a
+                        // walker scan here — the elevated relaunch is about to do
+                        // the real MFT scan, so a throwaway scan (and closing the
+                        // window mid-scan to relaunch) would just be jank. Only
+                        // record the chosen path so `trigger_elevation` can pass
+                        // it through, then open the warning dialog.
+                        if self.last_scanned_path.is_none() && self.path_input.trim().is_empty() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                self.path_input = folder.to_string_lossy().into_owned();
+                                self.turbo_warning_open = true;
+                            }
+                        } else {
+                            self.turbo_warning_open = true;
+                        }
+                    }
+                    TurboState::WarnUnsupported => self.turbo_unsupported_open = true,
+                    // Disabled never senses clicks; Active is already on.
+                    TurboState::Disabled | TurboState::Active => {}
                 }
             }
 
@@ -1151,6 +1284,128 @@ impl BytewhifferApp {
             self.error = None;
         }
     }
+
+    /// The Turbo toggle's current state, derived from the cached capability
+    /// check for the current target and whether this process is elevated. See
+    /// [`TurboState`].
+    fn turbo_state(&self) -> TurboState {
+        match self.turbo_availability {
+            // No scan has run yet, so the NTFS check hasn't happened at all —
+            // assume the common case (NTFS) rather than greying the toggle out
+            // pre-emptively. `start_scan` re-derives the real availability on
+            // the first scan and flips this to `WarnUnsupported`/`Disabled` if
+            // the target turns out not to be NTFS.
+            None if self.turbo_elevated => TurboState::Active,
+            None => TurboState::Promptable,
+            Some(Availability::Available) => TurboState::Active,
+            Some(Availability::RequiresElevation) => TurboState::Promptable,
+            Some(Availability::UnsupportedFilesystem) | Some(Availability::NotApplicable) => {
+                // An elevated process on a non-NTFS drive gets the distinct
+                // warning state; an unelevated one just can't use turbo here.
+                if self.turbo_elevated {
+                    TurboState::WarnUnsupported
+                } else {
+                    TurboState::Disabled
+                }
+            }
+        }
+    }
+
+    /// The pre-UAC confirmation dialog: turbo needs administrator rights, and
+    /// accepting relaunches the app elevated. The OS elevation prompt is never
+    /// triggered without this intermediate confirmation (turbo-mode spec).
+    fn turbo_warning_window(&mut self, ctx: &egui::Context) {
+        if !self.turbo_warning_open {
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Enable Turbo mode")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Turbo mode reads the NTFS Master File Table directly, for a much faster \
+                     scan on large drives.",
+                );
+                ui.add_space(4.0);
+                ui.colored_label(
+                    theme::TEXT_SUBTLE,
+                    "It needs administrator privileges. Windows will ask you to confirm, then \
+                     Bytewhiffer relaunches elevated and re-scans the current folder from scratch.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Continue").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        // Dismissing without confirming must not elevate (turbo-mode spec).
+        if cancel {
+            self.turbo_warning_open = false;
+        }
+        if confirm {
+            self.turbo_warning_open = false;
+            self.trigger_elevation(ctx);
+        }
+    }
+
+    /// Fires the OS elevation prompt via a self-relaunch. Accepting closes this
+    /// (unelevated) process so the fresh elevated one takes over; declining UAC
+    /// leaves this process running unchanged (the toggle returns to promptable).
+    fn trigger_elevation(&mut self, ctx: &egui::Context) {
+        let root = self.last_scanned_path.clone().or_else(|| {
+            let t = self.path_input.trim();
+            (!t.is_empty()).then(|| PathBuf::from(t))
+        });
+        let Some(root) = root else {
+            self.error = Some("Pick a folder to scan before enabling Turbo mode.".to_owned());
+            return;
+        };
+        match mft::relaunch_elevated(&root) {
+            Ok(true) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Ok(false) => {
+                // User declined UAC: nothing to do — stay unelevated. The
+                // toggle is still promptable, so they can try again.
+            }
+            Err(err) => {
+                self.error = Some(format!("Could not start Turbo mode: {err}"));
+            }
+        }
+    }
+
+    /// The "Turbo does not work for this drive" dialog, shown when an
+    /// already-elevated process's target is non-NTFS. The scan itself already
+    /// completed via the walker fallback; this only explains why turbo didn't
+    /// engage.
+    fn turbo_unsupported_window(&mut self, ctx: &egui::Context) {
+        if !self.turbo_unsupported_open {
+            return;
+        }
+        let mut dismissed = false;
+        egui::Window::new("Turbo mode unavailable for this drive")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Turbo mode only works on local NTFS volumes. This drive isn't NTFS, so \
+                     Bytewhiffer scanned it with the standard directory walker instead.",
+                );
+                ui.add_space(6.0);
+                if ui.button("OK").clicked() {
+                    dismissed = true;
+                }
+            });
+        if dismissed {
+            self.turbo_unsupported_open = false;
+        }
+    }
 }
 
 impl BytewhifferApp {
@@ -1247,6 +1502,12 @@ impl eframe::App for BytewhifferApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.debug_shot_tick(&ctx);
+        // The elevated relaunch lands here with a root to resume; kick it off
+        // once, on the first frame, now that the app is running.
+        if let Some(root) = self.pending_scan.take() {
+            self.path_input = root.display().to_string();
+            self.start_scan(root);
+        }
         self.drain_scan();
         if self.scan.is_some() {
             // Keep repainting while the scan streams events so the map
@@ -1290,6 +1551,8 @@ impl eframe::App for BytewhifferApp {
             });
 
         self.error_window(&ctx);
+        self.turbo_warning_window(&ctx);
+        self.turbo_unsupported_window(&ctx);
     }
 }
 
@@ -1735,6 +1998,51 @@ fn chrome_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response
         let tg = ui
             .painter()
             .layout_no_wrap(text.to_owned(), font, text_color);
+        let pos = rect.center() - tg.size() / 2.0;
+        ui.painter().galley(pos, tg, text_color);
+    }
+    response
+}
+
+/// The Turbo toggle, drawn in the same elevation language as `chrome_button`
+/// but colored by [`TurboState`]: greyed when disabled, muted chrome when
+/// promptable (leaning accent on hover), solid accent when active, and warning
+/// red when an elevated process is on a non-NTFS drive. Only the non-disabled
+/// states sense clicks.
+fn turbo_toggle(ui: &mut egui::Ui, text: &str, state: TurboState) -> egui::Response {
+    let font = FontId::proportional(13.0);
+    let pad = Vec2::new(12.0, 6.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
+    let size = galley.size() + pad * 2.0;
+    let clickable = !matches!(state, TurboState::Disabled);
+    let sense = if clickable { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+
+    if ui.is_rect_visible(rect) {
+        let hot = clickable && response.hovered();
+        let (base, text_color) = match state {
+            TurboState::Disabled => (theme::CHROME_BASE.gamma_multiply(0.5), theme::TEXT_SUBTLE),
+            TurboState::Promptable => {
+                if hot {
+                    (theme::ACCENT, theme::BG)
+                } else {
+                    (theme::CHROME_BASE, theme::TEXT)
+                }
+            }
+            TurboState::Active => (theme::ACCENT, theme::BG),
+            TurboState::WarnUnsupported => {
+                let fill = if hot {
+                    TURBO_WARN_RED.lerp_to_gamma(egui::Color32::WHITE, 0.12)
+                } else {
+                    TURBO_WARN_RED
+                };
+                (fill, theme::TEXT)
+            }
+        };
+        paint_surface(ui.painter(), rect, base);
+        let tg = ui.painter().layout_no_wrap(text.to_owned(), font, text_color);
         let pos = rect.center() - tg.size() / 2.0;
         ui.painter().galley(pos, tg, text_color);
     }

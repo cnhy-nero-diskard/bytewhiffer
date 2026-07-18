@@ -15,6 +15,28 @@ trash = "5.2"
 # --debug-screenshot flag that captures a frame for headless verification.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# The MFT turbo engine's raw-volume/elevation/relaunch surface is Windows-only
+# and pulled in only when building for Windows, so the cross-platform
+# `cargo test` on this dev machine (Linux) never compiles or downloads it. The
+# `$MFT` record parser itself is hand-rolled in `scanner::mft` and stays pure
+# and cross-platform — see that module and the change's design doc for why the
+# `ntfs` crate wasn't used (it has no public in-memory record-parsing entry
+# point, only volume-relative single-threaded reads, which is incompatible with
+# the flat-buffer + parallel-parse architecture).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    # SHELLEXECUTEINFOW carries an HKEY field (hkeyClass), so windows-rs's
+    # codegen ties the whole ShellExecuteExW/SHELLEXECUTEINFOW pair to this
+    # feature even though nothing here touches the registry.
+    "Win32_System_Registry",
+] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

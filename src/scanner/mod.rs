@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
+pub mod mft;
 pub mod walker;
 
 /// A single file or directory discovered during a scan.
