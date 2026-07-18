@@ -57,6 +57,14 @@ Standard, well-maintained, uses the native Windows file/folder dialog.
    prompt. Likely built on the `ntfs` crate (record parsing) plus the
    `windows` crate (raw volume handle, elevation).
 
+   **Status: implemented** (`2026-07-18-add-ntfs-turbo-mode`, archived under
+   `openspec/changes/archive/`). The `ntfs` crate was tried and rejected —
+   no public in-memory record-parsing entry point, only volume-relative
+   single-threaded reads, incompatible with the flat-buffer + parallel-parse
+   design actually used. See CLAUDE.md's "Turbo mode (NTFS `$MFT` engine)"
+   section for the current architecture (`scanner/mft.rs`'s pure/`#[cfg(windows)]`
+   split) rather than re-deriving it here.
+
 **Why phased rather than MFT-first:** it's the single riskiest, most novel,
 most Windows-specific piece of the whole project, and it can only be
 validated on real Windows hardware with admin rights — nothing about it can
@@ -126,7 +134,18 @@ liked for, rather than a blank screen until 100%.
 - Filtering by name, size, age, or other file properties
 - Tagging/annotating items during a cleanup pass
 - Exporting scan results (grouped summaries or flat file lists)
-- MFT "turbo mode" fast path (§2, Phase 2)
+
+### Since implemented (was V2, shipped ahead of schedule)
+- MFT "turbo mode" fast path (§2, Phase 2) — see CLAUDE.md's "Turbo mode"
+  section and the archived `2026-07-18-add-ntfs-turbo-mode` change
+
+Also since built, beyond this doc's original MVP/V2 scope entirely (each its
+own proposed-and-archived OpenSpec change, not called out here at the time
+this doc was written): an insights drawer (extension legend, size breakdown,
+leaderboard, blizzard/junk flags) and a treemap abstraction slider (collapse
+the map to fewer, bigger top-level blocks, with a hover-only preview of
+collapsed contents). See CLAUDE.md's "Insights drawer" and "Abstraction
+slider" sections for their current architecture.
 
 ### Explicitly out of scope (unless revisited later)
 - A separate directory tree/list side panel — this stays a pure graphical
@@ -143,7 +162,7 @@ src/
   scanner/
     mod.rs       — Entry tree type, shared ScanEngine trait, progress counters
     walker.rs    — Phase 1: parallel directory-walk engine
-    mft.rs       — Phase 2: NTFS MFT-read engine (added later)
+    mft.rs       — Phase 2: NTFS MFT-read engine (implemented; see CLAUDE.md)
   treemap.rs     — pure squarified-treemap layout algorithm, GUI-independent
   theme.rs       — color palette + deterministic color-from-extension logic
   util.rs        — byte-size formatting and small helpers
@@ -159,8 +178,21 @@ outside real Windows hardware.
 1. **MFT parsing + raw volume access.** Windows/NTFS-specific, needs a real
    machine with admin rights; nothing about it can be validated in a
    sandboxed or CI environment.
+
+   **Status:** de-risked on the parsing side — the record parser and
+   bottom-up tree reconstruction in `scanner/mft.rs` are pure and
+   cross-platform, unit-tested against hand-built synthetic `$MFT` byte
+   layouts, and that's what `cargo test` actually exercises. The part that
+   remains genuinely unvalidatable outside real hardware is unchanged: raw
+   `\\.\C:` volume reads, `TOKEN_ELEVATION`/UAC, and real-disk turbo-vs-walker
+   speed, all gated `#[cfg(windows)]`. Same closing-the-loop limitation as the
+   `--debug-perf` bench — see CLAUDE.md's "Turbo mode" section.
 2. **Treemap render interactivity.** Per-rectangle hit-testing, hover, and
    click-to-zoom at potentially thousands of visible rectangles.
+
+   **Status:** shipped and in continuous use across several changes since
+   (directory-enclosure theming, soft-elevation theming, the abstraction
+   slider's hover preview) without needing a redesign.
 
 Recommend small, standalone spikes for both before wiring up the full app —
 everything else here (navigation chrome, filtering, actions) is comparatively
