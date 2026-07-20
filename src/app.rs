@@ -61,6 +61,31 @@ const TOOLTIP_MAX_CHARS: usize = 64;
 /// Tuned against the `--debug-perf` spike; a global per-view switch (not
 /// per-block) so a view never mixes elevated and flat cards inconsistently.
 const DENSE_RENDER_THRESHOLD: usize = 1500;
+/// Font size for the size label painted in a block's or tray header's
+/// top-right corner — matches the existing name-label font size so both
+/// sit on the same baseline.
+const LABEL_FONT_SIZE: f32 = 11.0;
+/// Horizontal inset from a block's/header's edge to a corner label; mirrors
+/// the offsets already used when painting the name label.
+const LABEL_H_PAD: f32 = 6.0;
+/// Minimum width reserved for the name-label column before a size label is
+/// allowed to claim a file-card block's opposite corner, so the two labels
+/// never crowd each other even when the name itself renders short.
+const SIZE_LABEL_NAME_RESERVE: f32 = 44.0;
+/// Horizontal gap kept between a tray header's name (or collapsed-chain)
+/// label and its size label, so the two never sit flush against each other.
+const TRAY_LABEL_GAP: f32 = 10.0;
+/// Wall-clock time budget for one frame's scan-data processing — shared by
+/// `drain_scan`'s live-event draining and `PendingAssembly::step`'s
+/// authoritative-tree assembly. Bounds the actual frame-blocking duration
+/// directly (an item-count cap would still stall unpredictably depending on
+/// how expensive a given path happens to be to insert), so a discovery burst
+/// or a huge completed tree spreads its cost across multiple frames instead
+/// of stalling one.
+const SCAN_FRAME_BUDGET: Duration = Duration::from_millis(8);
+/// How many items a budgeted loop processes between wall-clock checks —
+/// avoids paying a clock read on literally every single item.
+const SCAN_BUDGET_CHECK_INTERVAL: usize = 256;
 
 /// UI-side mirror of the scan tree. Built incrementally from `ScanEvent`s
 /// while a scan runs (so the map fills in live), then swapped wholesale for
@@ -194,6 +219,79 @@ impl Node {
         for ptr in chain {
             unsafe {
                 (*ptr).size = (*ptr).size.saturating_sub(removed_size);
+            }
+        }
+        true
+    }
+}
+
+/// An in-progress, resumable conversion of the scan engine's authoritative
+/// `Entry` tree into the UI's `Node` shape, processed a bounded slice at a
+/// time (see `step`) across multiple frames instead of one uninterrupted
+/// recursion — the scan-completion counterpart to `drain_scan`'s own
+/// per-frame pacing. Unlike `Node::from_entry` (a plain recursive one-shot
+/// conversion, still used by contexts with no pacing concerns, e.g. the
+/// `--debug-perf` bench), this grows the destination tree via an explicit
+/// worklist so the traversal can pause between any two items and resume
+/// later from the same state — no call stack to suspend.
+struct PendingAssembly {
+    /// The tree being built. Starts as just the converted root; every
+    /// worklist item appends one more converted node under some already-
+    /// created parent.
+    root: Node,
+    /// Pending (path to the parent `Node` in `root`, not-yet-converted source
+    /// `Entry`) pairs, in visitation order. A path rather than a direct
+    /// reference to the parent, since the parent's `Vec<Node>` is still
+    /// growing as siblings are processed — indices stay valid across steps,
+    /// unlike a pointer or reference would.
+    worklist: Vec<(Vec<usize>, Entry)>,
+}
+
+impl PendingAssembly {
+    /// Starts a new resumable assembly: converts just the root entry and
+    /// queues its children for the first `step`.
+    fn start(entry: Entry) -> Self {
+        let root = Node::new(entry.name, entry.path, entry.size, entry.is_dir);
+        let worklist = entry
+            .children
+            .into_iter()
+            .map(|child| (Vec::new(), child))
+            .collect();
+        Self { root, worklist }
+    }
+
+    /// Processes worklist items until either the worklist empties (returns
+    /// `true` — assembly is fully complete, `root` is ready to swap in) or
+    /// `budget` of wall-clock time has elapsed (returns `false` — call again
+    /// next frame to continue from the same state). Checks elapsed time only
+    /// once every `SCAN_BUDGET_CHECK_INTERVAL` items, not per item, to avoid
+    /// paying a clock read on each one.
+    fn step(&mut self, budget: Duration) -> bool {
+        let started = Instant::now();
+        let mut since_check = 0usize;
+        while let Some((parent_path, entry)) = self.worklist.pop() {
+            let mut parent = &mut self.root;
+            for &i in &parent_path {
+                parent = &mut parent.children[i];
+            }
+            let idx = parent.children.len();
+            parent.child_index.insert(entry.name.clone(), idx);
+            parent
+                .children
+                .push(Node::new(entry.name, entry.path, entry.size, entry.is_dir));
+
+            let mut child_path = parent_path;
+            child_path.push(idx);
+            for child in entry.children {
+                self.worklist.push((child_path.clone(), child));
+            }
+
+            since_check += 1;
+            if since_check >= SCAN_BUDGET_CHECK_INTERVAL {
+                since_check = 0;
+                if started.elapsed() >= budget {
+                    return false;
+                }
             }
         }
         true
@@ -360,6 +458,10 @@ struct InsightsData {
     leaderboard: Vec<insights::LeaderboardEntry>,
     blizzard: Vec<insights::BlizzardEntry>,
     junk: Vec<insights::JunkEntry>,
+    /// The focused subtree's total size (`view.size`) — the denominator for
+    /// each row's proportional fill bar, so bars read as "% of what I'm
+    /// currently looking at" and rescale for free as focus changes.
+    total_size: u64,
 }
 
 #[derive(Default)]
@@ -441,6 +543,12 @@ pub struct BytewhifferApp {
     /// Whether the "Turbo does not work for this drive" dialog is open (raised
     /// when an already-elevated process's target is non-NTFS).
     turbo_unsupported_open: bool,
+    /// An in-progress, resumable conversion of a just-completed scan's
+    /// authoritative `Entry` tree into the UI's `Node` shape, advanced a
+    /// budgeted step per frame by `advance_pending_assembly`. `self.root`
+    /// (the live tree) stays displayed and interactive until this finishes
+    /// and swaps in, atomically — see `PendingAssembly`.
+    pending_assembly: Option<PendingAssembly>,
 }
 
 impl BytewhifferApp {
@@ -539,6 +647,9 @@ impl BytewhifferApp {
         self.top_level_sizes.clear();
         self.biggest_top_level = None;
         self.tree_rev = self.tree_rev.wrapping_add(1);
+        // Discard any still-in-progress assembly from a previous scan — it
+        // describes a tree that no longer matches this new target.
+        self.pending_assembly = None;
 
         let handle = std::thread::spawn(move || engine.scan(&target, &thread_ctx));
         self.scan = Some(ActiveScan {
@@ -554,7 +665,20 @@ impl BytewhifferApp {
         let mut discovered_any = false;
         if let Some(root) = &mut self.root {
             let base = root.path.clone();
-            for event in scan.events.try_iter() {
+            // Bounded to a wall-clock time slice rather than draining the
+            // whole backlog via `try_iter()`: a dense directory's parallel
+            // walker can queue events faster than the repaint cadence drains
+            // them, so an unbounded drain here would stall whichever frame
+            // finally gets a turn. Any remainder stays queued in the channel
+            // for the next call. Elapsed time is checked only once every
+            // `SCAN_BUDGET_CHECK_INTERVAL` events, not per event.
+            let started = Instant::now();
+            let mut since_check = 0usize;
+            loop {
+                let event = match scan.events.try_recv() {
+                    Ok(event) => event,
+                    Err(_) => break,
+                };
                 discovered_any = true;
                 let ScanEvent::Discovered { path, size, is_dir } = event;
                 if let Ok(rel) = path.strip_prefix(&base) {
@@ -572,6 +696,14 @@ impl BytewhifferApp {
                         }
                     }
                     root.insert(rel, size, is_dir);
+                }
+
+                since_check += 1;
+                if since_check >= SCAN_BUDGET_CHECK_INTERVAL {
+                    since_check = 0;
+                    if started.elapsed() >= SCAN_FRAME_BUDGET {
+                        break;
+                    }
                 }
             }
         }
@@ -612,12 +744,12 @@ impl BytewhifferApp {
             if let Some(handle) = scan.handle.take() {
                 match handle.join() {
                     Ok(Ok(entry)) => {
-                        self.root = Some(Node::from_entry(&entry));
-                        if let Some(root) = &self.root {
-                            if root.find(&self.focus).is_none() {
-                                self.focus.clear();
-                            }
-                        }
+                        // The live tree stays displayed and interactive; the
+                        // authoritative tree assembles across frames in the
+                        // background and only swaps in once fully built (see
+                        // `advance_pending_assembly`) — never a partially-
+                        // assembled authoritative tree shown mid-way.
+                        self.pending_assembly = Some(PendingAssembly::start(entry));
                     }
                     Ok(Err(err)) => {
                         self.error = Some(match err {
@@ -629,17 +761,40 @@ impl BytewhifferApp {
                             }
                         });
                         self.root = None;
+                        self.tree_rev = self.tree_rev.wrapping_add(1);
                     }
                     Err(_) => {
                         self.error = Some("The scan thread panicked.".to_owned());
                         self.root = None;
+                        self.tree_rev = self.tree_rev.wrapping_add(1);
                     }
                 }
             }
-            // The authoritative tree replaced the live one; recompute.
-            self.tree_rev = self.tree_rev.wrapping_add(1);
             self.scan = None;
         }
+    }
+
+    /// Advances the in-progress authoritative-tree assembly (if any) by one
+    /// budgeted step. Called every frame regardless of whether a scan is
+    /// still running, since assembly continues in the background after the
+    /// scan thread itself has already finished. Swaps `self.root` for the
+    /// finished tree in one atomic replace the moment assembly completes;
+    /// until then the existing live tree stays displayed and interactive.
+    fn advance_pending_assembly(&mut self) {
+        let Some(assembly) = &mut self.pending_assembly else {
+            return;
+        };
+        if !assembly.step(SCAN_FRAME_BUDGET) {
+            return;
+        }
+        let assembly = self.pending_assembly.take().unwrap();
+        self.root = Some(assembly.root);
+        if let Some(root) = &self.root {
+            if root.find(&self.focus).is_none() {
+                self.focus.clear();
+            }
+        }
+        self.tree_rev = self.tree_rev.wrapping_add(1);
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -1127,6 +1282,7 @@ impl BytewhifferApp {
                 leaderboard: view.leaderboard(LEADERBOARD_N),
                 blizzard: view.blizzard_flags(),
                 junk: view.junk_suggestions(),
+                total_size: view.size,
             }
         };
         self.insights_cache = Some(data);
@@ -1168,7 +1324,12 @@ impl BytewhifferApp {
                     insights_empty(ui, "No files in view.");
                 } else {
                     for (ext, size) in &data.ext_totals {
-                        ui.horizontal(|ui| {
+                        let fraction = if data.total_size > 0 {
+                            *size as f64 / data.total_size as f64
+                        } else {
+                            0.0
+                        };
+                        insights_bar_row(ui, fraction, |ui| {
                             swatch(ui, theme::color_for_extension(ext));
                             let label = if ext.is_empty() {
                                 "(no extension)".to_owned()
@@ -1192,14 +1353,23 @@ impl BytewhifferApp {
                     insights_empty(ui, "Nothing to rank yet.");
                 } else {
                     for entry in &data.leaderboard {
+                        let fraction = if data.total_size > 0 {
+                            entry.size as f64 / data.total_size as f64
+                        } else {
+                            0.0
+                        };
                         let icon = if entry.is_dir { "📁" } else { "📄" };
-                        let resp = ui
-                            .selectable_label(
-                                false,
-                                format!("{icon} {}  ·  {}", entry.name, format_size(entry.size)),
-                            )
-                            .on_hover_text(entry.path.display().to_string());
-                        if resp.clicked() {
+                        let mut clicked = false;
+                        insights_bar_row(ui, fraction, |ui| {
+                            let resp = ui
+                                .selectable_label(
+                                    false,
+                                    format!("{icon} {}  ·  {}", entry.name, format_size(entry.size)),
+                                )
+                                .on_hover_text(entry.path.display().to_string());
+                            clicked = resp.clicked();
+                        });
+                        if clicked {
                             new_focus = Some(focus_for(&base, &entry.trail, entry.is_dir));
                         }
                     }
@@ -1467,7 +1637,10 @@ impl BytewhifferApp {
             // the final frame rather than hanging forever.
         }
 
-        if self.scan.is_none() && self.root.is_some() {
+        // Also wait out the resumable authoritative-tree assembly — the
+        // "Final"/"Drill" captures should show the finished tree, not a
+        // still-live one mid-swap.
+        if self.scan.is_none() && self.pending_assembly.is_none() && self.root.is_some() {
             if mode == DebugShotMode::Drill && !self.debug_shot.as_ref().unwrap().drilled {
                 // Focus the root's largest directory child, as a click would.
                 if let Some(root) = &self.root {
@@ -1509,9 +1682,11 @@ impl eframe::App for BytewhifferApp {
             self.start_scan(root);
         }
         self.drain_scan();
-        if self.scan.is_some() {
-            // Keep repainting while the scan streams events so the map
-            // visibly fills in without waiting for input.
+        self.advance_pending_assembly();
+        if self.scan.is_some() || self.pending_assembly.is_some() {
+            // Keep repainting while the scan streams events, or the
+            // authoritative tree is still assembling in the background, so
+            // both visibly progress without waiting for input.
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -1599,6 +1774,36 @@ fn swatch(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().rect_filled(rect, 2.0, color);
 }
 
+/// Row height reserved for an Insights-drawer bar row — tall enough to hold
+/// the row's swatch/label/size content (or a leaderboard entry) without
+/// clipping.
+const INSIGHTS_BAR_ROW_H: f32 = 22.0;
+
+/// Reserves one Insights-drawer row's rect (mirroring `swatch()`'s own
+/// `ui.allocate_exact_size` pattern), paints a proportional-width fill bar
+/// into it — `theme::INSIGHTS_BAR`, scaled to `fraction` of the row's full
+/// width — then lays the row's actual content (`add_content`) on top via a
+/// child `Ui` scoped to that same rect, so the bar sits behind the row's
+/// widgets rather than replacing them.
+fn insights_bar_row(ui: &mut egui::Ui, fraction: f64, add_content: impl FnOnce(&mut egui::Ui)) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), INSIGHTS_BAR_ROW_H),
+        Sense::hover(),
+    );
+    let bar_width = rect.width() * fraction.clamp(0.0, 1.0) as f32;
+    if bar_width > 0.0 {
+        let bar_rect = Rect::from_min_size(rect.left_top(), Vec2::new(bar_width, rect.height()));
+        ui.painter()
+            .rect_filled(bar_rect, 2.0, theme::INSIGHTS_BAR.linear_multiply(0.35));
+    }
+    let mut content_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    add_content(&mut content_ui);
+}
+
 /// Walks down through a run of consecutive directories that each have
 /// exactly one child which is itself a directory, joining their names into a
 /// chain and returning the first directory that actually branches (zero
@@ -1614,6 +1819,47 @@ fn collapse_chain(start: &Node) -> (Vec<&str>, &Node) {
         names.push(node.name.as_str());
     }
     (names, node)
+}
+
+/// Whether a file-card block has room for a size label in its top-right
+/// corner without clipping or overlapping the name label already painted in
+/// the top-left. Distinct from the plain width/height check that gates the
+/// name label itself: a right-aligned size string can't rely on a clip rect
+/// the way the name label does, since clipping it would visually collide
+/// with the name rather than invisibly truncate — so this measures the size
+/// string's actual rendered width via the same galley-measurement pattern
+/// the chrome toggle buttons already use (`chrome_button`).
+fn size_label_fits(painter: &egui::Painter, block: Rect, size_str: &str) -> bool {
+    if block.height() <= DIR_LABEL_H + 2.0 {
+        return false;
+    }
+    let galley = painter.layout_no_wrap(
+        size_str.to_owned(),
+        FontId::proportional(LABEL_FONT_SIZE),
+        theme::TEXT,
+    );
+    let needed = SIZE_LABEL_NAME_RESERVE + galley.size().x + LABEL_H_PAD * 2.0;
+    block.width() > needed
+}
+
+/// Whether a directory tray's header has room for a size label alongside its
+/// name (or collapsed-chain) label — measuring that label's actual rendered
+/// width rather than reusing `size_label_fits`'s fixed reserve. A collapsed
+/// chain (`collapse_chain`) can produce a joined name long enough to consume
+/// most of the header on its own, so the tray gate has to account for that
+/// specific label's width rather than assume a short single name.
+fn tray_size_label_fits(painter: &egui::Painter, header_width: f32, label: &str, size_str: &str) -> bool {
+    let font = FontId::proportional(LABEL_FONT_SIZE);
+    let label_width = painter
+        .layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT)
+        .size()
+        .x;
+    let size_width = painter
+        .layout_no_wrap(size_str.to_owned(), font, theme::TEXT)
+        .size()
+        .x;
+    let needed = LABEL_H_PAD + label_width + TRAY_LABEL_GAP + size_width + LABEL_H_PAD;
+    header_width > needed
 }
 
 /// Recursively draws `node`'s children into `rect`, collecting hit-test rects
@@ -1701,7 +1947,7 @@ fn draw_children(
             // branches, using its name for the frame's identity color.
             let (chain, effective) = collapse_chain(child);
             let label = chain.join(" / ");
-            draw_tray_shell(painter, block, &label, &effective.name, depth);
+            draw_tray_shell(painter, block, &label, &effective.name, depth, effective.size);
 
             let chain_len = chain.len();
             for name in chain {
@@ -1779,14 +2025,26 @@ fn draw_children(
             // still identifies the block, which beats an anonymous color patch.
             let label_fits = block.width() > 30.0 && block.height() > DIR_LABEL_H + 2.0;
             if label_fits {
+                let label_color = theme::label_text_color(base);
                 let label_painter = painter.with_clip_rect(block);
                 label_painter.text(
                     block.left_top() + Vec2::new(6.0, 3.0),
                     Align2::LEFT_TOP,
                     &child.name,
                     FontId::proportional(11.0),
-                    theme::TEXT,
+                    label_color,
                 );
+
+                let size_str = format_size(child.size);
+                if size_label_fits(painter, block, &size_str) {
+                    label_painter.text(
+                        block.right_top() + Vec2::new(-6.0, 3.0),
+                        Align2::RIGHT_TOP,
+                        size_str,
+                        FontId::proportional(11.0),
+                        label_color,
+                    );
+                }
             }
 
             trail.pop();
@@ -1858,7 +2116,14 @@ fn build_preview_shapes(node: &Node, rect: Rect, depth: usize, out: &mut Vec<egu
 /// container being drawn, not from any collapsed intermediate level. Children
 /// (raised cards) are drawn afterward, on top, packed flush against the
 /// border.
-fn draw_tray_shell(painter: &egui::Painter, block: Rect, label: &str, color_name: &str, depth: usize) {
+fn draw_tray_shell(
+    painter: &egui::Painter,
+    block: Rect,
+    label: &str,
+    color_name: &str,
+    depth: usize,
+    size: u64,
+) {
     let border = theme::dir_frame_border_color(color_name, depth);
     let fill = theme::dir_frame_fill_color(border);
     painter.rect_filled(block, theme::TRAY_CORNER_RADIUS, fill);
@@ -1873,19 +2138,28 @@ fn draw_tray_shell(painter: &egui::Painter, block: Rect, label: &str, color_name
         block.left_top(),
         Pos2::new(block.right(), block.top() + DIR_LABEL_H),
     );
-    painter.rect_filled(
-        header,
-        theme::TRAY_CORNER_RADIUS,
-        theme::tray_header_color(color_name, depth),
-    );
+    let header_color = theme::tray_header_color(color_name, depth);
+    painter.rect_filled(header, theme::TRAY_CORNER_RADIUS, header_color);
+    let label_color = theme::label_text_color(header_color);
     let label_painter = painter.with_clip_rect(header);
     label_painter.text(
         header.left_top() + Vec2::new(6.0, 2.0),
         Align2::LEFT_TOP,
         label,
         FontId::proportional(11.0),
-        theme::TEXT,
+        label_color,
     );
+
+    let size_str = format_size(size);
+    if tray_size_label_fits(painter, header.width(), label, &size_str) {
+        label_painter.text(
+            header.right_top() + Vec2::new(-6.0, 2.0),
+            Align2::RIGHT_TOP,
+            size_str,
+            FontId::proportional(11.0),
+            label_color,
+        );
+    }
 }
 
 /// Builds a rounded rectangle filled with a vertical top→bottom colour
@@ -2550,6 +2824,101 @@ mod abstraction_tests {
         // level itself.
         let top_level = abstract_blocks.iter().filter(|b| b.depth == 0).count();
         assert_eq!(top_level, root.children.len());
+    }
+}
+
+#[cfg(test)]
+mod scan_responsiveness_tests {
+    use super::*;
+
+    /// Builds a synthetic `Entry` tree `depth` levels deep, each directory
+    /// branching into `fanout` children (the deepest level all files), so a
+    /// resumable assembly of it needs many more than `SCAN_BUDGET_CHECK_INTERVAL`
+    /// items — and therefore several simulated "frames" at a tiny budget.
+    fn build_entry_tree(name: &str, depth: usize, fanout: usize) -> Entry {
+        if depth == 0 {
+            return Entry {
+                name: name.to_string(),
+                path: PathBuf::from(name),
+                size: 4096,
+                is_dir: false,
+                children: Vec::new(),
+            };
+        }
+        let children: Vec<Entry> = (0..fanout)
+            .map(|i| build_entry_tree(&format!("{name}_{i}"), depth - 1, fanout))
+            .collect();
+        let size = children.iter().map(|c| c.size).sum();
+        Entry {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            size,
+            is_dir: true,
+            children,
+        }
+    }
+
+    /// Order-independent structural comparison: same name/path/size/is_dir,
+    /// same child count, and every child in `a` has a matching (recursively
+    /// equivalent) child in `b` by name. Insertion order of `Node::children`
+    /// carries no meaning anywhere in the app (`draw_children` re-sorts by
+    /// size every frame), and the resumable assembly's worklist-based
+    /// traversal deliberately doesn't preserve the recursive one-shot
+    /// build's sibling order — so this is the right notion of "matches",
+    /// not a plain derived `Vec` equality.
+    fn trees_equivalent(a: &Node, b: &Node) -> bool {
+        if a.name != b.name || a.path != b.path || a.size != b.size || a.is_dir != b.is_dir {
+            return false;
+        }
+        if a.children.len() != b.children.len() {
+            return false;
+        }
+        a.children.iter().all(|child| {
+            b.child_index
+                .get(&child.name)
+                .is_some_and(|&bi| trees_equivalent(child, &b.children[bi]))
+        })
+    }
+
+    #[test]
+    fn resumable_assembly_matches_one_shot_reference_build() {
+        let tree = build_entry_tree("root", 4, 5); // 5^4 = 625 leaves, 781 entries total
+        let reference = Node::from_entry(&tree);
+
+        // A near-zero budget forces `step` to bail after every batch of
+        // `SCAN_BUDGET_CHECK_INTERVAL` items, simulating many small frames
+        // rather than one big one.
+        let mut assembly = PendingAssembly::start(tree);
+        let mut frames = 0usize;
+        loop {
+            frames += 1;
+            assert!(frames < 10_000, "assembly should finish well before this many frames");
+            if assembly.step(Duration::from_nanos(1)) {
+                break;
+            }
+        }
+        assert!(
+            frames > 1,
+            "a tree this size should need more than one simulated frame at a near-zero budget"
+        );
+        assert!(
+            trees_equivalent(&assembly.root, &reference),
+            "paced multi-frame assembly must match a one-shot reference build: same sizes, \
+             structure, and child counts"
+        );
+    }
+
+    #[test]
+    fn resumable_assembly_completes_a_small_tree_in_one_step() {
+        let tree = build_entry_tree("root", 2, 3);
+        let reference = Node::from_entry(&tree);
+
+        let mut assembly = PendingAssembly::start(tree);
+        assert!(
+            assembly.step(SCAN_FRAME_BUDGET),
+            "a small tree should assemble within the normal per-frame budget in one call"
+        );
+        assert!(trees_equivalent(&assembly.root, &reference));
     }
 }
 
