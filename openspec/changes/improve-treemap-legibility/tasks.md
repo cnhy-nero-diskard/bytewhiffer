@@ -47,17 +47,54 @@
       (`app.rs:1194`-`1205`), sizing each bar to
       `entry.size as f64 / total_size as f64`.
 
-## 4. Verification
+## 4. Scan responsiveness: paced event drain + resumable tree assembly
 
-- [ ] 4.1 Run `cargo test` — confirm the new `theme.rs` test and all
-      existing scanner/treemap/theme/util tests still pass headlessly.
-- [ ] 4.2 Run `cargo check --target x86_64-pc-windows-gnu` — confirm the
+- [ ] 4.1 Add a per-frame wall-clock time-budget constant to `app.rs`,
+      shared by the event-drain loop and the resumable assembly (or two
+      separate constants — decide at implementation time per the design's
+      Open Questions).
+- [ ] 4.2 Change `drain_scan`'s event-processing loop (`app.rs:557`) to
+      stop once elapsed time since the loop started exceeds the budget,
+      leaving the remainder of `scan.events`'s backlog queued in the
+      channel for the next frame's call rather than draining it all via
+      unconditional `try_iter()`.
+- [ ] 4.3 Restructure `Node::from_entry` (`app.rs:134`) from a plain
+      recursion into an explicit, resumable worklist traversal (a
+      stack/queue of pending `(Entry, target-parent)` items) that can
+      process a bounded slice per call and be resumed on the next call
+      from the same in-progress state.
+- [ ] 4.4 Add new state (on `ActiveScan` or `BytewhifferApp`) to hold an
+      in-progress resumable assembly across frames, replacing the direct
+      `Node::from_entry` call at scan completion (`app.rs:612`-`621`) with
+      "start (or continue) the resumable assembly this frame, budget-
+      limited."
+- [ ] 4.5 Keep displaying and allow interaction with the existing live
+      `self.root` tree while the resumable assembly runs in the
+      background; swap `self.root` for the fully-assembled authoritative
+      tree only once assembly completes, in a single atomic replace —
+      never show a partially-assembled authoritative tree.
+- [ ] 4.6 Add a new unit test: assemble a synthetic large `Entry` tree via
+      the resumable traversal across multiple simulated "frames" (a small
+      per-call budget/step count) and assert the result matches a
+      one-shot reference build on the same input (same sizes, same
+      structure, same child counts).
+
+## 5. Verification
+
+- [ ] 5.1 Run `cargo test` — confirm the new `theme.rs` test, the new
+      resumable-assembly test, and all existing scanner/treemap/theme/util
+      tests still pass headlessly.
+- [ ] 5.2 Run `cargo check --target x86_64-pc-windows-gnu` — confirm the
       Windows-only surface still type-checks (this change shouldn't touch
       any `#[cfg(windows)]` code, but verify).
-- [ ] 4.3 Capture `--debug-screenshot`, `--debug-screenshot-live`, and
+- [ ] 5.3 Capture `--debug-screenshot`, `--debug-screenshot-live`, and
       `--debug-screenshot-drill` against a real, varied tree (a dense
       small-file cluster, a deep single-child chain, a large scan) and
       visually confirm: size labels appear/disappear at sensible
       thresholds without clipping or colliding with name labels, label
       text reads clearly against multiple block hues, and the Insights
       bars render and rescale correctly when drilling in and out.
+- [ ] 5.4 On real Windows hardware, scan a large/dense real directory
+      (e.g. a deep `node_modules` tree or a full user profile) before and
+      after this change and confirm the mid-scan and post-scan stutters
+      are gone or substantially shortened.
