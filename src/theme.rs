@@ -55,6 +55,30 @@ const DIR_FRAME_TINT_TOWARD_BG: f32 = 0.88;
 const DEPTH_LIFT: f32 = 0.035;
 const DEPTH_LIFT_MAX: f32 = 0.18;
 
+/// How far an on-block label's darken overlay pulls toward black, proportional
+/// to whatever color/lightness sits beneath it (not a fixed gray constant), so
+/// a name/size label stays legible whether painted over a file-band color, a
+/// directory-band color, or the elevation gradient's lightened top edge.
+const LABEL_DARKEN: f32 = 0.55;
+
+/// On-block label text color: darkens `base` (the block's own fill color,
+/// after any depth shift) toward black by a fixed proportion — an
+/// alpha-blended black overlay, not one fixed gray for every block — so the
+/// file-card name label, the directory tray header label, and the size label
+/// all stay legible across the full hue/lightness range without per-color
+/// tuning.
+pub fn label_text_color(base: Color32) -> Color32 {
+    base.lerp_to_gamma(Color32::BLACK, LABEL_DARKEN)
+}
+
+/// Flat neutral fill color for the Insights drawer's proportional bars (the
+/// "File types" and "Biggest items" rows). Deliberately distinct from both
+/// the per-extension swatch color (which must stay in lockstep with the
+/// treemap's own colors) and the reserved `ACCENT` (hover/breadcrumb/
+/// selection only) — this is a data-visualization surface, not an
+/// interactive one, so it gets its own separate semantic color.
+pub const INSIGHTS_BAR: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x50);
+
 // --- Soft-elevation treatment -------------------------------------------
 // Blocks and chrome read as raised cards: a top-lighter/bottom-darker
 // gradient fill, a soft drop shadow, and a modest corner radius. These
@@ -376,6 +400,22 @@ mod tests {
             chrome.offset[1] <= card.offset[1],
             "chrome shadow must not sit lower than the card shadow"
         );
+    }
+
+    #[test]
+    fn label_text_color_darkens_file_and_directory_band_colors() {
+        // Mirrors `gradient_stops_bracket_the_base_in_lightness`: the label
+        // darken must actually darken, across both bands it gets applied to.
+        let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+        let file_band = color_for_extension("rs");
+        let dir_band = base_block_color("Games", true);
+        for base in [file_band, dir_band] {
+            let label = label_text_color(base);
+            assert!(
+                lum(label) < lum(base),
+                "label color should be darker than the block base it's painted over"
+            );
+        }
     }
 
     #[test]
