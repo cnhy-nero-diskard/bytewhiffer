@@ -1,20 +1,4 @@
-# scan-status-bar
-
-## Purpose
-Defines the toolbar's Rescan control, the in-flight scan HUD (indeterminate progress plus live metrics), and the persistent bottom status bar — the chrome that keeps the user informed while a scan runs and after it finishes, without duplicating figures between the two.
-
-## Requirements
-
-### Requirement: Rescan control
-The system SHALL provide a toolbar control that re-runs a scan against the currently scanned root path, without requiring the user to re-select or re-type it.
-
-#### Scenario: Rescan re-runs against the current root
-- **WHEN** a scan has completed (or been cancelled) for a given root path and the user activates the Rescan control
-- **THEN** a new scan starts against that same root path, without the user re-entering it
-
-#### Scenario: Rescan is unavailable before any scan has run
-- **WHEN** no scan has ever completed or started in the current session
-- **THEN** the Rescan control is not available, since there is no root path yet to rescan
+## MODIFIED Requirements
 
 ### Requirement: In-flight scan HUD
 The system SHALL display, while a scan is in progress or its authoritative tree is still being assembled, an indeterminate progress indicator and live metrics: files scanned, directories scanned, bytes scanned, scan rate, elapsed time, and the largest top-level item discovered so far. Elapsed time SHALL continue to update live for as long as either phase is still active. Once the walk phase finishes and only tree assembly remains, the HUD SHALL switch to a distinct "finishing up" state showing genuine completion progress (assembly's total item count is known up front, unlike the open-ended walk phase).

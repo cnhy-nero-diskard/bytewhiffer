@@ -18,7 +18,9 @@ use crate::scanner::{
 };
 use crate::theme;
 use crate::treemap;
-use crate::util::{elide_middle, format_duration, format_size};
+use crate::util::{
+    elide_middle, format_duration, format_duration_live, format_size, format_size_precise,
+};
 
 /// Stop nesting once a block is this small; below it nothing inside would
 /// be readable or clickable anyway.
@@ -86,6 +88,11 @@ const SCAN_FRAME_BUDGET: Duration = Duration::from_millis(8);
 /// How many items a budgeted loop processes between wall-clock checks —
 /// avoids paying a clock read on literally every single item.
 const SCAN_BUDGET_CHECK_INTERVAL: usize = 256;
+/// Smoothing factor for the scan-rate EMA (`rate = rate*(1-α) + instant*α`),
+/// applied at the same ~1s cadence as `rate_sample`. Chosen by feel against a
+/// large scan target — high enough to track a real trend within a couple
+/// samples, low enough that a single noisy per-second delta doesn't dominate.
+const RATE_EMA_ALPHA: f64 = 0.3;
 
 /// UI-side mirror of the scan tree. Built incrementally from `ScanEvent`s
 /// while a scan runs (so the map fills in live), then swapped wholesale for
@@ -245,6 +252,11 @@ struct PendingAssembly {
     /// growing as siblings are processed — indices stay valid across steps,
     /// unlike a pointer or reference would.
     worklist: Vec<(Vec<usize>, Entry)>,
+    /// Total items ever queued onto `worklist` (grows as a popped entry's own
+    /// children are queued in `step`), so `progress` can derive an exact
+    /// completion fraction — unlike the open-ended walk phase, assembly's
+    /// total work is knowable as it's discovered.
+    total: usize,
 }
 
 impl PendingAssembly {
@@ -252,12 +264,17 @@ impl PendingAssembly {
     /// queues its children for the first `step`.
     fn start(entry: Entry) -> Self {
         let root = Node::new(entry.name, entry.path, entry.size, entry.is_dir);
-        let worklist = entry
+        let worklist: Vec<(Vec<usize>, Entry)> = entry
             .children
             .into_iter()
             .map(|child| (Vec::new(), child))
             .collect();
-        Self { root, worklist }
+        let total = worklist.len();
+        Self {
+            root,
+            worklist,
+            total,
+        }
     }
 
     /// Processes worklist items until either the worklist empties (returns
@@ -284,6 +301,7 @@ impl PendingAssembly {
             child_path.push(idx);
             for child in entry.children {
                 self.worklist.push((child_path.clone(), child));
+                self.total += 1;
             }
 
             since_check += 1;
@@ -295,6 +313,16 @@ impl PendingAssembly {
             }
         }
         true
+    }
+
+    /// Fraction of queued assembly work completed so far, in `[0.0, 1.0]`.
+    /// Exact, not an estimate — `total` counts every item ever queued.
+    fn progress(&self) -> f32 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        let completed = self.total.saturating_sub(self.worklist.len());
+        completed as f32 / self.total as f32
     }
 }
 
@@ -487,12 +515,26 @@ pub struct BytewhifferApp {
     /// roughly once a second so the rate doesn't jitter between repaints.
     rate_sample: Option<(Instant, u64)>,
     scan_rate_bps: f64,
+    /// Exponential moving average of `scan_rate_bps`, updated at the same
+    /// ~1s cadence. Displayed instead of the raw per-second delta so the
+    /// HUD's added rate precision (see `format_size_precise`) shows real
+    /// trend rather than per-second sampling jitter. `None` until the first
+    /// sample of a scan.
+    smoothed_rate_bps: Option<f64>,
     /// Running per-top-level-child byte totals, updated once per discovery
     /// event so the largest child of the scan root can be tracked without
     /// re-walking the live tree.
     top_level_sizes: HashMap<String, u64>,
     biggest_top_level: Option<(String, u64)>,
     last_summary: Option<ScanSummary>,
+    /// The walk phase's final files/dirs/bytes counts, captured when the walk
+    /// thread returns but before tree assembly (`pending_assembly`) has
+    /// finished — these counters are already stable at that point (the engine
+    /// contract guarantees it), only `elapsed` still needs assembly to finish
+    /// before it means "total scan time". `advance_pending_assembly` takes
+    /// this and pairs it with a fresh `elapsed` to build the real
+    /// `last_summary` once assembly swaps the tree in.
+    pending_summary_counts: Option<(u64, u64, u64)>,
     /// Whether the left-side Insights drawer is open. Closed by default so
     /// the treemap stays full-width until the user summons it.
     insights_open: bool,
@@ -644,12 +686,14 @@ impl BytewhifferApp {
         self.scan_started_at = Some(Instant::now());
         self.rate_sample = None;
         self.scan_rate_bps = 0.0;
+        self.smoothed_rate_bps = None;
         self.top_level_sizes.clear();
         self.biggest_top_level = None;
         self.tree_rev = self.tree_rev.wrapping_add(1);
         // Discard any still-in-progress assembly from a previous scan — it
         // describes a tree that no longer matches this new target.
         self.pending_assembly = None;
+        self.pending_summary_counts = None;
 
         let handle = std::thread::spawn(move || engine.scan(&target, &thread_ctx));
         self.scan = Some(ActiveScan {
@@ -721,7 +765,12 @@ impl BytewhifferApp {
             Some((t, b)) => {
                 let dt = now.duration_since(t).as_secs_f64();
                 if dt >= 1.0 {
-                    self.scan_rate_bps = bytes_now.saturating_sub(b) as f64 / dt;
+                    let raw = bytes_now.saturating_sub(b) as f64 / dt;
+                    self.scan_rate_bps = raw;
+                    self.smoothed_rate_bps = Some(match self.smoothed_rate_bps {
+                        Some(prev) => prev * (1.0 - RATE_EMA_ALPHA) + raw * RATE_EMA_ALPHA,
+                        None => raw,
+                    });
                     self.rate_sample = Some((now, bytes_now));
                 }
             }
@@ -732,15 +781,14 @@ impl BytewhifferApp {
         // the join right after it can only block momentarily.
         let finished = scan.ctx.progress.is_complete();
         if finished {
-            self.last_summary = Some(ScanSummary {
-                files: scan.ctx.progress.files_scanned.load(Ordering::Relaxed),
-                dirs: scan.ctx.progress.dirs_scanned.load(Ordering::Relaxed),
-                bytes: scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed),
-                elapsed: self
-                    .scan_started_at
-                    .map(|t| t.elapsed())
-                    .unwrap_or_default(),
-            });
+            // Stable the instant the walk finishes (the `ScanEngine` contract
+            // guarantees final counts before returning) — only `elapsed`
+            // still needs assembly to finish before it means "total scan
+            // time", so it's deliberately not captured here. See
+            // `pending_summary_counts` and `advance_pending_assembly`.
+            let files = scan.ctx.progress.files_scanned.load(Ordering::Relaxed);
+            let dirs = scan.ctx.progress.dirs_scanned.load(Ordering::Relaxed);
+            let bytes = scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed);
             if let Some(handle) = scan.handle.take() {
                 match handle.join() {
                     Ok(Ok(entry)) => {
@@ -748,8 +796,11 @@ impl BytewhifferApp {
                         // authoritative tree assembles across frames in the
                         // background and only swaps in once fully built (see
                         // `advance_pending_assembly`) — never a partially-
-                        // assembled authoritative tree shown mid-way.
+                        // assembled authoritative tree shown mid-way. The
+                        // summary itself isn't finalized until that swap-in
+                        // either, so `last_summary` isn't set here.
                         self.pending_assembly = Some(PendingAssembly::start(entry));
+                        self.pending_summary_counts = Some((files, dirs, bytes));
                     }
                     Ok(Err(err)) => {
                         self.error = Some(match err {
@@ -762,11 +813,31 @@ impl BytewhifferApp {
                         });
                         self.root = None;
                         self.tree_rev = self.tree_rev.wrapping_add(1);
+                        // No assembly phase follows a failed scan, so there's
+                        // nothing further to wait on — finalize immediately.
+                        self.last_summary = Some(ScanSummary {
+                            files,
+                            dirs,
+                            bytes,
+                            elapsed: self
+                                .scan_started_at
+                                .map(|t| t.elapsed())
+                                .unwrap_or_default(),
+                        });
                     }
                     Err(_) => {
                         self.error = Some("The scan thread panicked.".to_owned());
                         self.root = None;
                         self.tree_rev = self.tree_rev.wrapping_add(1);
+                        self.last_summary = Some(ScanSummary {
+                            files,
+                            dirs,
+                            bytes,
+                            elapsed: self
+                                .scan_started_at
+                                .map(|t| t.elapsed())
+                                .unwrap_or_default(),
+                        });
                     }
                 }
             }
@@ -780,6 +851,9 @@ impl BytewhifferApp {
     /// scan thread itself has already finished. Swaps `self.root` for the
     /// finished tree in one atomic replace the moment assembly completes;
     /// until then the existing live tree stays displayed and interactive.
+    /// This is also the point `last_summary` is finalized (see
+    /// `pending_summary_counts`) — its `elapsed` reflects total scan time
+    /// including assembly, not just the walk.
     fn advance_pending_assembly(&mut self) {
         let Some(assembly) = &mut self.pending_assembly else {
             return;
@@ -794,7 +868,27 @@ impl BytewhifferApp {
                 self.focus.clear();
             }
         }
+        if let Some((files, dirs, bytes)) = self.pending_summary_counts.take() {
+            self.last_summary = Some(ScanSummary {
+                files,
+                dirs,
+                bytes,
+                elapsed: self
+                    .scan_started_at
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default(),
+            });
+        }
         self.tree_rev = self.tree_rev.wrapping_add(1);
+    }
+
+    /// Whether the HUD-visible "still working" state should be considered
+    /// active — covers both the background walk and the authoritative-tree
+    /// assembly that can keep running after the walk thread returns. Drives
+    /// `scan_hud`'s visibility, the live-elapsed clock, and `status_bar`'s
+    /// decision to stay quiet about a finalized summary.
+    fn scan_or_assembly_active(&self) -> bool {
+        self.scan.is_some() || self.pending_assembly.is_some()
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -908,57 +1002,97 @@ impl BytewhifferApp {
         });
     }
 
-    /// In-flight scan HUD: an indeterminate/pulsing progress bar plus every
-    /// *live* number the scan can report. Shown only while `self.scan` is
-    /// `Some`; owns these figures exclusively so the bottom status bar can
-    /// stay quiet about them until the scan completes.
+    /// In-flight scan HUD, covering both phases of a scan: the background
+    /// walk (indeterminate progress, since the walker can't know a total
+    /// size ahead of time) and, once the walk finishes, the authoritative-
+    /// tree assembly that can keep running for more frames on a large tree
+    /// (real completion progress, since assembly's total item count is known
+    /// as it's queued — see `PendingAssembly::progress`). Shown for as long
+    /// as `scan_or_assembly_active()` is true; owns these figures exclusively
+    /// so the bottom status bar can stay quiet about them until both phases
+    /// are done.
     fn scan_hud(&mut self, ui: &mut egui::Ui) {
-        let Some(scan) = &self.scan else { return };
-        let files = scan.ctx.progress.files_scanned.load(Ordering::Relaxed);
-        let dirs = scan.ctx.progress.dirs_scanned.load(Ordering::Relaxed);
-        let bytes = scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed);
+        if !self.scan_or_assembly_active() {
+            return;
+        }
         let elapsed = self
             .scan_started_at
             .map(|t| t.elapsed())
             .unwrap_or_default();
-        let rate = self.scan_rate_bps;
-        let biggest = self.biggest_top_level.clone();
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
 
-            // Motion only — no fill level tied to completion, since the
-            // parallel walker has no way to know a scan's total size ahead
-            // of time. `0.5` is an arbitrary constant, not a fraction of
-            // anything real.
-            ui.add(
-                egui::ProgressBar::new(0.5)
-                    .animate(true)
-                    .desired_width(110.0)
-                    .desired_height(6.0)
-                    .fill(theme::ACCENT),
-            );
+            if let Some(scan) = &self.scan {
+                let files = scan.ctx.progress.files_scanned.load(Ordering::Relaxed);
+                let dirs = scan.ctx.progress.dirs_scanned.load(Ordering::Relaxed);
+                let bytes = scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed);
+                let rate = self.smoothed_rate_bps.unwrap_or(0.0);
+                let biggest = self.biggest_top_level.clone();
 
-            ui.colored_label(
-                theme::TEXT_SUBTLE,
-                format!("{files} files · {dirs} dirs · {}", format_size(bytes)),
-            );
-            ui.colored_label(theme::TEXT_SUBTLE, format!("{}/s", format_size(rate as u64)));
-            ui.colored_label(theme::TEXT_SUBTLE, format_duration(elapsed));
-            if let Some((name, size)) = biggest {
-                ui.colored_label(
-                    theme::TEXT_SUBTLE,
-                    format!("Largest so far: {name} ({})", format_size(size)),
+                // Motion only — no fill level tied to completion, since the
+                // parallel walker has no way to know a scan's total size
+                // ahead of time. `0.5` is an arbitrary constant, not a
+                // fraction of anything real.
+                ui.add(
+                    egui::ProgressBar::new(0.5)
+                        .animate(true)
+                        .desired_width(110.0)
+                        .desired_height(6.0)
+                        .fill(theme::ACCENT),
                 );
+
+                mono_label(
+                    ui,
+                    theme::TEXT_SUBTLE,
+                    format!(
+                        "{files} files · {dirs} dirs · {}",
+                        format_size_precise(bytes)
+                    ),
+                );
+                mono_label(
+                    ui,
+                    theme::TEXT_SUBTLE,
+                    format!("{}/s", format_size_precise(rate as u64)),
+                );
+                if let Some((name, size)) = biggest {
+                    ui.colored_label(
+                        theme::TEXT_SUBTLE,
+                        format!("Largest so far: {name} ({})", format_size(size)),
+                    );
+                }
+            } else if let Some(assembly) = &self.pending_assembly {
+                // The walk has finished; only tree assembly remains. Unlike
+                // the walk's indeterminate bar, assembly's total item count
+                // is known as it's queued, so this shows real progress.
+                ui.add(
+                    egui::ProgressBar::new(assembly.progress())
+                        .desired_width(110.0)
+                        .desired_height(6.0)
+                        .fill(theme::ACCENT),
+                );
+                ui.colored_label(theme::TEXT_SUBTLE, "Finishing up…");
+                if let Some((files, dirs, bytes)) = self.pending_summary_counts {
+                    mono_label(
+                        ui,
+                        theme::TEXT_SUBTLE,
+                        format!("{files} files · {dirs} dirs · {}", format_size(bytes)),
+                    );
+                }
             }
+
+            mono_label(ui, theme::TEXT_SUBTLE, format_duration_live(elapsed));
         });
     }
 
     /// Persistent bottom status bar: a hover readout on the left (mirrors
     /// the block tooltip but never disappears), and on the right a scan
     /// summary that survives past scan completion plus the engine name.
-    /// Goes quiet about live counts while a scan is running, since the HUD
-    /// above already owns those.
+    /// Goes quiet about live counts while a scan or its tree assembly is
+    /// still in progress, since the HUD above already owns those — the
+    /// summary shown here isn't finalized until `advance_pending_assembly`
+    /// swaps the assembled tree in, so it never shows a final-looking number
+    /// before the map has actually finished updating.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -979,6 +1113,8 @@ impl BytewhifferApp {
                 }
                 if self.scan.is_some() {
                     ui.colored_label(theme::TEXT_SUBTLE, "Scanning…");
+                } else if self.pending_assembly.is_some() {
+                    ui.colored_label(theme::TEXT_SUBTLE, "Finishing up…");
                 } else if let Some(summary) = &self.last_summary {
                     ui.colored_label(
                         theme::TEXT_SUBTLE,
@@ -1694,7 +1830,7 @@ impl eframe::App for BytewhifferApp {
             ui.add_space(4.0);
             self.toolbar(ui);
             ui.add_space(2.0);
-            if self.scan.is_some() {
+            if self.scan_or_assembly_active() {
                 self.scan_hud(ui);
                 ui.add_space(2.0);
             }
@@ -2353,6 +2489,14 @@ fn chrome_chip(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
     response
 }
 
+/// Renders `text` in `color` with a monospace font, for the HUD's ticking
+/// elapsed-time and byte/rate labels — a fixed-width font keeps digit-count
+/// changes (`"9s"` → `"10s"`) from reflowing neighboring HUD labels every
+/// tick, unlike the proportional font used elsewhere in the toolbar.
+fn mono_label(ui: &mut egui::Ui, color: egui::Color32, text: impl Into<String>) {
+    ui.label(egui::RichText::new(text.into()).monospace().color(color));
+}
+
 /// Runs the hidden `--debug-perf` tessellation spike: builds a synthetic
 /// dense tree shaped like the motivating screenshot (a big DLL-heavy system
 /// dir, an installers dir, a dense file mosaic, plus nested app dirs), lays
@@ -2919,6 +3063,48 @@ mod scan_responsiveness_tests {
             "a small tree should assemble within the normal per-frame budget in one call"
         );
         assert!(trees_equivalent(&assembly.root, &reference));
+    }
+
+    #[test]
+    fn assembly_progress_rises_monotonically_to_one() {
+        let tree = build_entry_tree("root", 4, 5); // needs several simulated frames
+        let mut assembly = PendingAssembly::start(tree);
+        assert!(
+            assembly.progress() < 1.0,
+            "freshly-started assembly with queued work should not already read complete"
+        );
+
+        let mut last = assembly.progress();
+        loop {
+            let done = assembly.step(Duration::from_nanos(1));
+            let now = assembly.progress();
+            assert!(
+                now >= last,
+                "progress must never go backwards across steps ({last} -> {now})"
+            );
+            last = now;
+            if done {
+                break;
+            }
+        }
+        assert_eq!(assembly.progress(), 1.0, "a finished assembly reads as fully complete");
+    }
+
+    #[test]
+    fn assembly_progress_is_complete_for_a_childless_root() {
+        let tree = Entry {
+            name: "lonely".to_string(),
+            path: PathBuf::from("lonely"),
+            size: 0,
+            is_dir: true,
+            children: Vec::new(),
+        };
+        let assembly = PendingAssembly::start(tree);
+        assert_eq!(
+            assembly.progress(),
+            1.0,
+            "nothing queued means nothing left to finish"
+        );
     }
 }
 
