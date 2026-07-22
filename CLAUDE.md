@@ -93,6 +93,10 @@ The toolbar's abstraction slider (`app.rs`'s `self.abstraction`, `0.0` detail ..
 
 The UI half lives in `app.rs`: `turbo_elevated` (detected once at startup — the UAC relaunch produces an elevated process — and never persisted), `turbo_availability` (recomputed per scan-target change), and `turbo_state()` mapping those to the toggle's four states (disabled / promptable / active / warning-red). The promptable click path is warn-dialog → `mft::relaunch_elevated` → UAC → the elevated process relaunches with the hidden `--elevated-scan <path>` flag (parsed in `main.rs`, same pass-through pattern as `--debug-screenshot*`) and starts a clean scan at that root. `dead_code` in the parser is suppressed *only* on non-Windows non-test builds via `#![cfg_attr(not(any(windows, test)), allow(dead_code))]`, so detection stays active where the code actually compiles-in. Anything touching raw volumes, real elevation, or turbo-vs-walker speed can only be verified by a human on real Windows hardware in an elevated session (same closing-the-loop limitation as `--debug-perf`).
 
+## Releasing
+
+`scripts/release.ps1 -Bump patch|minor|major` (or `-Version X.Y.Z`; `scripts/release.sh patch|minor|major|X.Y.Z` is the WSL/bash equivalent, requires `perl` for the `Cargo.lock` sync) bumps `Cargo.toml`'s version, keeps `Cargo.lock`'s matching entry in sync, commits, and creates the `vX.Y.Z` tag — it does not push. Review the commit/tag, then `git push && git push origin vX.Y.Z`. Pushing the tag triggers `.github/workflows/release.yml`, which now verifies the tag matches `Cargo.toml`'s version before building (fails fast on mismatch) and then builds/publishes the GitHub Release with `bytewhiffer.exe` attached.
+
 ## Development process
 
 This repo uses [OpenSpec](https://github.com/Fission-AI/OpenSpec) for spec-driven change management (`openspec/` directory: `changes/<name>/proposal.md`, `design.md`, `specs/*/spec.md`, `tasks.md`). Check `openspec/changes/` for in-progress work before starting something that might overlap.
