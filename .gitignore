@@ -1,2 +1,12 @@
 node_modules/
 target/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
