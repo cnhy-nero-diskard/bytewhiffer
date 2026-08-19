@@ -299,8 +299,14 @@ mod tests {
 
     #[test]
     fn same_directory_name_same_frame_color() {
-        assert_eq!(base_block_color("Games", true), base_block_color("Games", true));
-        assert_eq!(base_block_color("GAMES", true), base_block_color("games", true));
+        assert_eq!(
+            base_block_color("Games", true),
+            base_block_color("Games", true)
+        );
+        assert_eq!(
+            base_block_color("GAMES", true),
+            base_block_color("games", true)
+        );
     }
 
     #[test]
@@ -343,7 +349,10 @@ mod tests {
         let d3 = dir_frame_border_color("dir", 3);
         assert!(d1.r() >= base.r() && d1.g() >= base.g() && d1.b() >= base.b());
         assert!(d3.r() >= d1.r());
-        assert_eq!(dir_frame_border_color("dir", 50), dir_frame_border_color("dir", 100));
+        assert_eq!(
+            dir_frame_border_color("dir", 50),
+            dir_frame_border_color("dir", 100)
+        );
     }
 
     #[test]
@@ -365,7 +374,10 @@ mod tests {
         for ext in ["rs", "png", "exe", "zip", ""] {
             let base = color_for_extension(ext);
             let (top, bottom) = gradient_stops(base);
-            assert!(lum(top) > lum(base), "{ext}: top should be lighter than base");
+            assert!(
+                lum(top) > lum(base),
+                "{ext}: top should be lighter than base"
+            );
             assert!(
                 lum(bottom) < lum(base),
                 "{ext}: bottom should be darker than base"
