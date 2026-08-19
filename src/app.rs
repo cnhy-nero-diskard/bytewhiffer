@@ -628,7 +628,6 @@ impl BytewhifferApp {
 
 impl BytewhifferApp {
     fn start_scan(&mut self, target: PathBuf) {
-        let target = normalize_target(target);
         self.requested_target = Some(target.clone());
         self.path_input = target.display().to_string();
 
@@ -961,7 +960,6 @@ impl BytewhifferApp {
                         // it through, then open the warning dialog.
                         if self.requested_target.is_none() && self.path_input.trim().is_empty() {
                             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                let folder = normalize_target(folder);
                                 self.path_input = folder.display().to_string();
                                 self.requested_target = Some(folder.clone());
                                 self.turbo_availability = Some(MftEngine.is_available(&folder));
@@ -1613,7 +1611,7 @@ impl BytewhifferApp {
         if typed.is_empty() {
             self.requested_target.clone()
         } else {
-            Some(normalize_target(PathBuf::from(typed)))
+            Some(PathBuf::from(typed))
         }
     }
 
@@ -3313,13 +3311,6 @@ mod scan_lifecycle_ui_tests {
         app.pending_assembly = None;
         assert!(app.delete_available());
     }
-}
-
-/// Normalizes one action target without using historical scan state as a
-/// fallback. Existing targets are left as-is so invalid paths still reach the
-/// scanner and produce the normal root-readable error.
-fn normalize_target(path: PathBuf) -> PathBuf {
-    PathBuf::from(path.to_string_lossy().trim())
 }
 
 /// Opens the system file manager with `path` selected. On Windows this is

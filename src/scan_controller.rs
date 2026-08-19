@@ -40,9 +40,16 @@ pub struct ScanCompletion {
 }
 
 /// Owns and joins retired worker handles away from the UI thread.
+///
+/// Its own thread handle is retained (not discarded) so that dropping a
+/// `WorkerReaper` can synchronously close the channel and join the thread,
+/// guaranteeing every handle queued up to that point is actually joined
+/// before shutdown proceeds — a bare `Sender` drop only lets the thread
+/// *start* draining, it doesn't wait for it to finish.
 struct WorkerReaper {
-    sender: Sender<JoinHandle<()>>,
+    sender: Option<Sender<JoinHandle<()>>>,
     joined: Arc<AtomicUsize>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl WorkerReaper {
@@ -50,7 +57,7 @@ impl WorkerReaper {
         let (sender, receiver) = mpsc::channel::<JoinHandle<()>>();
         let joined = Arc::new(AtomicUsize::new(0));
         let reaper_joined = joined.clone();
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("bytewhiffer-scan-reaper".to_owned())
             .spawn(move || {
                 while let Ok(handle) = receiver.recv() {
@@ -59,24 +66,42 @@ impl WorkerReaper {
                 }
             })
             .expect("scan reaper thread must start");
-        Self { sender, joined }
+        Self {
+            sender: Some(sender),
+            joined,
+            handle: Some(handle),
+        }
     }
 
     fn retire(&self, handle: JoinHandle<()>) {
-        if let Err(error) = self.sender.send(handle) {
-            // This only occurs during shutdown. Preserve the invariant that
-            // every handle is joined without making the caller wait.
-            let joined = self.joined.clone();
-            thread::spawn(move || {
-                let _ = error.0.join();
-                joined.fetch_add(1, Ordering::Release);
-            });
+        let Some(sender) = self.sender.as_ref() else {
+            // The reaper thread has already been shut down. Preserve the
+            // invariant that every handle is joined even in this edge case.
+            let _ = handle.join();
+            self.joined.fetch_add(1, Ordering::Release);
+            return;
+        };
+        if let Err(error) = sender.send(handle) {
+            let _ = error.0.join();
+            self.joined.fetch_add(1, Ordering::Release);
         }
     }
 
     #[cfg(test)]
     fn joined_count(&self) -> usize {
         self.joined.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for WorkerReaper {
+    fn drop(&mut self) {
+        // Close the channel first so the reaper thread's `recv()` loop drains
+        // every handle already queued and then returns, then join it
+        // synchronously so shutdown cannot proceed until that drain is done.
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -269,8 +294,9 @@ impl Default for ScanController {
 impl Drop for ScanController {
     fn drop(&mut self) {
         self.retire_current();
-        // Dropping the reaper sender after transferring the current handle
-        // lets the reaper finish queued joins and then exit on its own thread.
+        // `reaper` drops next (declaration order), which closes its channel
+        // and synchronously joins its thread — guaranteeing the handle just
+        // queued above is actually joined before this call returns.
     }
 }
 
@@ -533,5 +559,36 @@ mod tests {
         let second = controller.start(PathBuf::from("b"), Box::new(ReturnEngine::success("b")));
         assert_ne!(first, 0);
         assert!(second > first);
+    }
+
+    #[test]
+    fn dropping_the_reaper_synchronously_joins_every_queued_handle() {
+        let reaper = WorkerReaper::new();
+        let joined = reaper.joined.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let worker_started = started.clone();
+        let worker_release = release.clone();
+        let handle = thread::Builder::new()
+            .spawn(move || {
+                worker_started.store(true, Ordering::Release);
+                while !worker_release.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+            })
+            .expect("worker thread must start");
+        reaper.retire(handle);
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        // The worker is still running and unjoined at this point.
+        assert_eq!(joined.load(Ordering::Acquire), 0);
+        release.store(true, Ordering::Release);
+
+        // Dropping the reaper must not return until its thread has drained
+        // the queue and joined the worker above — this is the shutdown
+        // invariant a bare `Sender` drop cannot provide.
+        drop(reaper);
+        assert_eq!(joined.load(Ordering::Acquire), 1);
     }
 }
