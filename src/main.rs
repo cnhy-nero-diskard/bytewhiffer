@@ -2,6 +2,7 @@
 
 mod app;
 mod insights;
+mod scan_controller;
 mod scanner;
 mod theme;
 mod treemap;

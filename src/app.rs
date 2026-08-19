@@ -4,17 +4,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{self, Receiver};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::insights;
+use crate::scan_controller::{ScanCompletion, ScanController};
 use crate::scanner::{
     mft::{self, MftEngine},
     walker::WalkerEngine,
-    Availability, Entry, ScanContext, ScanEngine, ScanError, ScanEvent,
+    Availability, Entry, ScanEngine, ScanError, ScanEvent, ScanId, ScanOutcome,
 };
 use crate::theme;
 use crate::treemap;
@@ -156,7 +155,8 @@ impl Node {
             Some(&i) => node.children[i].size += size,
             None => {
                 let i = node.children.len();
-                node.children.push(Node::new(leaf.clone(), path, size, is_dir));
+                node.children
+                    .push(Node::new(leaf.clone(), path, size, is_dir));
                 node.child_index.insert(leaf, i);
             }
         }
@@ -190,10 +190,7 @@ impl Node {
     /// proxy for the render-tier decision (see `BytewhifferApp::refresh_density`),
     /// walked once per (focus, tree_rev) change rather than every frame.
     fn descendant_count(&self) -> usize {
-        self.children
-            .iter()
-            .map(|c| 1 + c.descendant_count())
-            .sum()
+        self.children.iter().map(|c| 1 + c.descendant_count()).sum()
     }
 
     /// Removes the node at `names`, subtracting its size from every
@@ -242,6 +239,7 @@ impl Node {
 /// worklist so the traversal can pause between any two items and resume
 /// later from the same state — no call stack to suspend.
 struct PendingAssembly {
+    id: ScanId,
     /// The tree being built. Starts as just the converted root; every
     /// worklist item appends one more converted node under some already-
     /// created parent.
@@ -262,7 +260,7 @@ struct PendingAssembly {
 impl PendingAssembly {
     /// Starts a new resumable assembly: converts just the root entry and
     /// queues its children for the first `step`.
-    fn start(entry: Entry) -> Self {
+    fn start_for(id: ScanId, entry: Entry) -> Self {
         let root = Node::new(entry.name, entry.path, entry.size, entry.is_dir);
         let worklist: Vec<(Vec<usize>, Entry)> = entry
             .children
@@ -271,6 +269,7 @@ impl PendingAssembly {
             .collect();
         let total = worklist.len();
         Self {
+            id,
             root,
             worklist,
             total,
@@ -349,13 +348,6 @@ enum TurboState {
 /// general palette color — turbo is the one place a "this won't work" signal
 /// is surfaced on a control that is otherwise interactive.
 const TURBO_WARN_RED: egui::Color32 = egui::Color32::from_rgb(0xda, 0x36, 0x33);
-
-/// A scan running on a background thread, plus the channels to observe it.
-struct ActiveScan {
-    ctx: ScanContext,
-    events: Receiver<ScanEvent>,
-    handle: Option<JoinHandle<Result<Entry, ScanError>>>,
-}
 
 /// The render posture's resolved nesting gate for one frame: a directory
 /// subdivides only if it is shallower than `max_depth` *and* clears the pixel
@@ -496,7 +488,7 @@ struct InsightsData {
 pub struct BytewhifferApp {
     path_input: String,
     root: Option<Node>,
-    scan: Option<ActiveScan>,
+    scan_controller: ScanController,
     /// Names from the root node down to the focused directory.
     focus: Vec<String>,
     /// Block the open context menu refers to (trail from root, fs path).
@@ -508,6 +500,14 @@ pub struct BytewhifferApp {
     /// Root path of the most recently started scan, kept after the scan
     /// completes (or fails) so Rescan can re-run it without retyping.
     last_scanned_path: Option<PathBuf>,
+    /// The single target selected for the next scan action. This is updated
+    /// when a folder is picked or when free-form text is resolved at action
+    /// time; historical `last_scanned_path` never takes precedence over it.
+    requested_target: Option<PathBuf>,
+    /// Generation currently being walked or assembled. Keeping this beside
+    /// the controller lets assembly reject a result that was superseded before
+    /// the next frame.
+    scan_generation: Option<ScanId>,
     /// Name of the engine that produced, or is producing, the current scan.
     engine_name: Option<&'static str>,
     scan_started_at: Option<Instant>,
@@ -534,7 +534,7 @@ pub struct BytewhifferApp {
     /// before it means "total scan time". `advance_pending_assembly` takes
     /// this and pairs it with a fresh `elapsed` to build the real
     /// `last_summary` once assembly swaps the tree in.
-    pending_summary_counts: Option<(u64, u64, u64)>,
+    pending_summary_counts: Option<(ScanId, u64, u64, u64)>,
     /// Whether the left-side Insights drawer is open. Closed by default so
     /// the treemap stays full-width until the user summons it.
     insights_open: bool,
@@ -628,6 +628,10 @@ impl BytewhifferApp {
 
 impl BytewhifferApp {
     fn start_scan(&mut self, target: PathBuf) {
+        let target = normalize_target(target);
+        self.requested_target = Some(target.clone());
+        self.path_input = target.display().to_string();
+
         // Re-derive turbo capability for this target — the spec requires the
         // check be re-evaluated on every target change, never cached.
         let turbo_avail = MftEngine.is_available(&target);
@@ -662,16 +666,9 @@ impl BytewhifferApp {
         }
 
         let engine_name = engine.name();
-        let (tx, rx) = mpsc::channel();
-        let thread_ctx = ScanContext::new().with_events(tx);
         // The UI keeps its own handles to the same cancel/progress state,
         // but not to the event sender — otherwise the channel would never
         // disconnect when the scan thread finishes.
-        let ui_ctx = ScanContext {
-            cancel: thread_ctx.cancel.clone(),
-            progress: thread_ctx.progress.clone(),
-            events: None,
-        };
 
         let root_name = target
             .file_name()
@@ -695,36 +692,27 @@ impl BytewhifferApp {
         self.pending_assembly = None;
         self.pending_summary_counts = None;
 
-        let handle = std::thread::spawn(move || engine.scan(&target, &thread_ctx));
-        self.scan = Some(ActiveScan {
-            ctx: ui_ctx,
-            events: rx,
-            handle: Some(handle),
-        });
+        let id = self.scan_controller.start(target, engine);
+        self.scan_generation = Some(id);
     }
 
     fn drain_scan(&mut self) {
-        let Some(scan) = &mut self.scan else { return };
-
+        let events = self.scan_controller.take_events(SCAN_FRAME_BUDGET);
+        let current_id = self.scan_controller.current_id();
         let mut discovered_any = false;
         if let Some(root) = &mut self.root {
             let base = root.path.clone();
-            // Bounded to a wall-clock time slice rather than draining the
-            // whole backlog via `try_iter()`: a dense directory's parallel
-            // walker can queue events faster than the repaint cadence drains
-            // them, so an unbounded drain here would stall whichever frame
-            // finally gets a turn. Any remainder stays queued in the channel
-            // for the next call. Elapsed time is checked only once every
-            // `SCAN_BUDGET_CHECK_INTERVAL` events, not per event.
-            let started = Instant::now();
-            let mut since_check = 0usize;
-            loop {
-                let event = match scan.events.try_recv() {
-                    Ok(event) => event,
-                    Err(_) => break,
-                };
+            for event in events {
+                let ScanEvent::Discovered {
+                    scan_id,
+                    path,
+                    size,
+                    is_dir,
+                } = event;
+                if Some(scan_id) != current_id {
+                    continue;
+                }
                 discovered_any = true;
-                let ScanEvent::Discovered { path, size, is_dir } = event;
                 if let Ok(rel) = path.strip_prefix(&base) {
                     if let Some(first) = rel.components().next() {
                         let top_name = first.as_os_str().to_string_lossy().into_owned();
@@ -734,114 +722,106 @@ impl BytewhifferApp {
                         let is_new_max = self
                             .biggest_top_level
                             .as_ref()
-                            .map_or(true, |(_, max)| total > *max);
+                            .is_none_or(|(_, max)| total > *max);
                         if is_new_max {
                             self.biggest_top_level = Some((top_name, total));
                         }
                     }
                     root.insert(rel, size, is_dir);
                 }
-
-                since_check += 1;
-                if since_check >= SCAN_BUDGET_CHECK_INTERVAL {
-                    since_check = 0;
-                    if started.elapsed() >= SCAN_FRAME_BUDGET {
-                        break;
-                    }
-                }
             }
         }
-        // A live scan grows the tree; let the drawer recompute against it.
         if discovered_any {
             self.tree_rev = self.tree_rev.wrapping_add(1);
         }
 
-        // Refresh the scan-rate sample roughly once a second so the number
-        // doesn't jitter between the ~100ms repaints a streaming scan drives.
         let now = Instant::now();
-        let bytes_now = scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed);
-        match self.rate_sample {
-            None => self.rate_sample = Some((now, bytes_now)),
-            Some((t, b)) => {
-                let dt = now.duration_since(t).as_secs_f64();
-                if dt >= 1.0 {
-                    let raw = bytes_now.saturating_sub(b) as f64 / dt;
-                    self.scan_rate_bps = raw;
-                    self.smoothed_rate_bps = Some(match self.smoothed_rate_bps {
-                        Some(prev) => prev * (1.0 - RATE_EMA_ALPHA) + raw * RATE_EMA_ALPHA,
-                        None => raw,
-                    });
-                    self.rate_sample = Some((now, bytes_now));
+        if let Some(progress) = self.scan_controller.current_progress() {
+            let bytes_now = progress.bytes_scanned.load(Ordering::Relaxed);
+            match self.rate_sample {
+                None => self.rate_sample = Some((now, bytes_now)),
+                Some((t, b)) => {
+                    let dt = now.duration_since(t).as_secs_f64();
+                    if dt >= 1.0 {
+                        let raw = bytes_now.saturating_sub(b) as f64 / dt;
+                        self.scan_rate_bps = raw;
+                        self.smoothed_rate_bps = Some(match self.smoothed_rate_bps {
+                            Some(prev) => prev * (1.0 - RATE_EMA_ALPHA) + raw * RATE_EMA_ALPHA,
+                            None => raw,
+                        });
+                        self.rate_sample = Some((now, bytes_now));
+                    }
                 }
             }
         }
 
-        // The trait contract guarantees engines mark progress complete
-        // before returning, so this is the "no longer in flight" signal;
-        // the join right after it can only block momentarily.
-        let finished = scan.ctx.progress.is_complete();
-        if finished {
-            // Stable the instant the walk finishes (the `ScanEngine` contract
-            // guarantees final counts before returning) — only `elapsed`
-            // still needs assembly to finish before it means "total scan
-            // time", so it's deliberately not captured here. See
-            // `pending_summary_counts` and `advance_pending_assembly`.
-            let files = scan.ctx.progress.files_scanned.load(Ordering::Relaxed);
-            let dirs = scan.ctx.progress.dirs_scanned.load(Ordering::Relaxed);
-            let bytes = scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed);
-            if let Some(handle) = scan.handle.take() {
-                match handle.join() {
-                    Ok(Ok(entry)) => {
-                        // The live tree stays displayed and interactive; the
-                        // authoritative tree assembles across frames in the
-                        // background and only swaps in once fully built (see
-                        // `advance_pending_assembly`) — never a partially-
-                        // assembled authoritative tree shown mid-way. The
-                        // summary itself isn't finalized until that swap-in
-                        // either, so `last_summary` isn't set here.
-                        self.pending_assembly = Some(PendingAssembly::start(entry));
-                        self.pending_summary_counts = Some((files, dirs, bytes));
-                    }
-                    Ok(Err(err)) => {
-                        self.error = Some(match err {
-                            ScanError::Unavailable(a) => {
-                                format!("Scan engine unavailable for this target: {a:?}")
-                            }
-                            ScanError::RootUnreadable(e) => {
-                                format!("Cannot read that folder: {e}")
-                            }
-                        });
-                        self.root = None;
-                        self.tree_rev = self.tree_rev.wrapping_add(1);
-                        // No assembly phase follows a failed scan, so there's
-                        // nothing further to wait on — finalize immediately.
-                        self.last_summary = Some(ScanSummary {
-                            files,
-                            dirs,
-                            bytes,
-                            elapsed: self
-                                .scan_started_at
-                                .map(|t| t.elapsed())
-                                .unwrap_or_default(),
-                        });
-                    }
-                    Err(_) => {
-                        self.error = Some("The scan thread panicked.".to_owned());
-                        self.root = None;
-                        self.tree_rev = self.tree_rev.wrapping_add(1);
-                        self.last_summary = Some(ScanSummary {
-                            files,
-                            dirs,
-                            bytes,
-                            elapsed: self
-                                .scan_started_at
-                                .map(|t| t.elapsed())
-                                .unwrap_or_default(),
-                        });
-                    }
-                }
+        if let Some(completion) = self.scan_controller.poll_completion() {
+            self.finish_scan(completion);
+        }
+    }
+
+    // guarantees final counts before returning) — only `elapsed`
+    // `advance_pending_assembly`) — never a partially-
+    // nothing further to wait on — finalize immediately.
+
+    fn finish_scan(&mut self, completion: ScanCompletion) {
+        if self.scan_generation != Some(completion.id) {
+            return;
+        }
+        let files = completion.progress.files_scanned.load(Ordering::Relaxed);
+        let dirs = completion.progress.dirs_scanned.load(Ordering::Relaxed);
+        let bytes = completion.progress.bytes_scanned.load(Ordering::Relaxed);
+        self.engine_name = Some(completion.engine_name);
+
+        match completion.outcome {
+            ScanOutcome::Success(entry) => {
+                self.pending_assembly = Some(PendingAssembly::start_for(completion.id, entry));
+                self.pending_summary_counts = Some((completion.id, files, dirs, bytes));
             }
-            self.scan = None;
+            ScanOutcome::Cancelled => {
+                self.pending_assembly = None;
+                self.pending_summary_counts = None;
+                self.root = None;
+                self.focus.clear();
+                self.tree_rev = self.tree_rev.wrapping_add(1);
+            }
+            ScanOutcome::Failed(err) => {
+                self.error = Some(match err {
+                    ScanError::Unavailable(a) => {
+                        format!("Scan engine unavailable for this target: {a:?}")
+                    }
+                    ScanError::RootUnreadable(e) => format!("Cannot read that folder: {e}"),
+                });
+                self.pending_assembly = None;
+                self.pending_summary_counts = None;
+                self.root = None;
+                self.tree_rev = self.tree_rev.wrapping_add(1);
+                self.last_summary = Some(ScanSummary {
+                    files,
+                    dirs,
+                    bytes,
+                    elapsed: self
+                        .scan_started_at
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default(),
+                });
+            }
+            ScanOutcome::Panicked => {
+                self.error = Some("The scan thread panicked.".to_owned());
+                self.pending_assembly = None;
+                self.pending_summary_counts = None;
+                self.root = None;
+                self.tree_rev = self.tree_rev.wrapping_add(1);
+                self.last_summary = Some(ScanSummary {
+                    files,
+                    dirs,
+                    bytes,
+                    elapsed: self
+                        .scan_started_at
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default(),
+                });
+            }
         }
     }
 
@@ -855,6 +835,15 @@ impl BytewhifferApp {
     /// `pending_summary_counts`) — its `elapsed` reflects total scan time
     /// including assembly, not just the walk.
     fn advance_pending_assembly(&mut self) {
+        if self
+            .pending_assembly
+            .as_ref()
+            .is_some_and(|assembly| self.scan_generation != Some(assembly.id))
+        {
+            self.pending_assembly = None;
+            self.pending_summary_counts = None;
+            return;
+        }
         let Some(assembly) = &mut self.pending_assembly else {
             return;
         };
@@ -868,16 +857,18 @@ impl BytewhifferApp {
                 self.focus.clear();
             }
         }
-        if let Some((files, dirs, bytes)) = self.pending_summary_counts.take() {
-            self.last_summary = Some(ScanSummary {
-                files,
-                dirs,
-                bytes,
-                elapsed: self
-                    .scan_started_at
-                    .map(|t| t.elapsed())
-                    .unwrap_or_default(),
-            });
+        if let Some((id, files, dirs, bytes)) = self.pending_summary_counts.take() {
+            if id == assembly.id {
+                self.last_summary = Some(ScanSummary {
+                    files,
+                    dirs,
+                    bytes,
+                    elapsed: self
+                        .scan_started_at
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default(),
+                });
+            }
         }
         self.tree_rev = self.tree_rev.wrapping_add(1);
     }
@@ -888,7 +879,11 @@ impl BytewhifferApp {
     /// `scan_hud`'s visibility, the live-elapsed clock, and `status_bar`'s
     /// decision to stay quiet about a finalized summary.
     fn scan_or_assembly_active(&self) -> bool {
-        self.scan.is_some() || self.pending_assembly.is_some()
+        self.scan_controller.is_active() || self.pending_assembly.is_some()
+    }
+
+    fn delete_available(&self) -> bool {
+        !self.scan_or_assembly_active()
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -921,11 +916,15 @@ impl BytewhifferApp {
             if (chrome_button(ui, "Scan", true).clicked() || submitted)
                 && !self.path_input.trim().is_empty()
             {
-                self.start_scan(PathBuf::from(self.path_input.trim()));
+                if let Some(path) = self.resolve_requested_target() {
+                    self.start_scan(path);
+                }
             }
 
-            if chrome_button(ui, "Rescan", self.last_scanned_path.is_some()).clicked() {
-                if let Some(path) = self.last_scanned_path.clone() {
+            let rescan_available =
+                self.requested_target.is_some() || !self.path_input.trim().is_empty();
+            if chrome_button(ui, "Rescan", rescan_available).clicked() {
+                if let Some(path) = self.resolve_requested_target() {
                     self.start_scan(path);
                 }
             }
@@ -948,6 +947,7 @@ impl BytewhifferApp {
             };
             let resp = turbo_toggle(ui, label, state).on_hover_text(hover);
             if resp.clicked() {
+                let _ = self.resolve_requested_target();
                 match state {
                     TurboState::Promptable => {
                         // No target yet (nothing scanned, nothing typed): let the
@@ -959,9 +959,12 @@ impl BytewhifferApp {
                         // window mid-scan to relaunch) would just be jank. Only
                         // record the chosen path so `trigger_elevation` can pass
                         // it through, then open the warning dialog.
-                        if self.last_scanned_path.is_none() && self.path_input.trim().is_empty() {
+                        if self.requested_target.is_none() && self.path_input.trim().is_empty() {
                             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                self.path_input = folder.to_string_lossy().into_owned();
+                                let folder = normalize_target(folder);
+                                self.path_input = folder.display().to_string();
+                                self.requested_target = Some(folder.clone());
+                                self.turbo_availability = Some(MftEngine.is_available(&folder));
                                 self.turbo_warning_open = true;
                             }
                         } else {
@@ -993,9 +996,9 @@ impl BytewhifferApp {
             );
             ui.colored_label(theme::TEXT_SUBTLE, "Abstract");
 
-            if let Some(scan) = &self.scan {
+            if self.scan_controller.is_active() {
                 if chrome_button(ui, "Cancel", true).clicked() {
-                    scan.ctx.cancel.store(true, Ordering::Relaxed);
+                    self.scan_controller.cancel_current();
                 }
                 ui.spinner();
             }
@@ -1023,10 +1026,10 @@ impl BytewhifferApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
 
-            if let Some(scan) = &self.scan {
-                let files = scan.ctx.progress.files_scanned.load(Ordering::Relaxed);
-                let dirs = scan.ctx.progress.dirs_scanned.load(Ordering::Relaxed);
-                let bytes = scan.ctx.progress.bytes_scanned.load(Ordering::Relaxed);
+            if let Some(progress) = self.scan_controller.current_progress() {
+                let files = progress.files_scanned.load(Ordering::Relaxed);
+                let dirs = progress.dirs_scanned.load(Ordering::Relaxed);
+                let bytes = progress.bytes_scanned.load(Ordering::Relaxed);
                 let rate = self.smoothed_rate_bps.unwrap_or(0.0);
                 let biggest = self.biggest_top_level.clone();
 
@@ -1072,7 +1075,7 @@ impl BytewhifferApp {
                         .fill(theme::ACCENT),
                 );
                 ui.colored_label(theme::TEXT_SUBTLE, "Finishing up…");
-                if let Some((files, dirs, bytes)) = self.pending_summary_counts {
+                if let Some((_, files, dirs, bytes)) = self.pending_summary_counts {
                     mono_label(
                         ui,
                         theme::TEXT_SUBTLE,
@@ -1111,7 +1114,7 @@ impl BytewhifferApp {
                 if let Some(name) = self.engine_name {
                     ui.colored_label(theme::TEXT_SUBTLE, name);
                 }
-                if self.scan.is_some() {
+                if self.scan_controller.is_active() {
                     ui.colored_label(theme::TEXT_SUBTLE, "Scanning…");
                 } else if self.pending_assembly.is_some() {
                     ui.colored_label(theme::TEXT_SUBTLE, "Finishing up…");
@@ -1203,7 +1206,7 @@ impl BytewhifferApp {
         };
 
         if focus_node.children.is_empty() {
-            let msg = if self.scan.is_some() {
+            let msg = if self.scan_controller.is_active() {
                 "Scanning…"
             } else {
                 "Nothing here"
@@ -1348,7 +1351,15 @@ impl BytewhifferApp {
 
         ui.separator();
 
-        if ui.button("🗑 Delete").clicked() {
+        let delete_available = self.delete_available();
+        let delete_button = ui.add_enabled(delete_available, egui::Button::new("🗑 Delete"));
+        if !delete_available {
+            ui.colored_label(
+                theme::TEXT_SUBTLE,
+                "Delete is available after scanning finishes.",
+            );
+        }
+        if delete_button.clicked() {
             match trash::delete(&fs_path) {
                 Ok(()) => {
                     if let Some(root) = &mut self.root {
@@ -1500,7 +1511,11 @@ impl BytewhifferApp {
                             let resp = ui
                                 .selectable_label(
                                     false,
-                                    format!("{icon} {}  ·  {}", entry.name, format_size(entry.size)),
+                                    format!(
+                                        "{icon} {}  ·  {}",
+                                        entry.name,
+                                        format_size(entry.size)
+                                    ),
                                 )
                                 .on_hover_text(entry.path.display().to_string());
                             clicked = resp.clicked();
@@ -1541,7 +1556,10 @@ impl BytewhifferApp {
                 if data.junk.is_empty() {
                     insights_empty(ui, "No known-junk matches.");
                 } else {
-                    ui.colored_label(theme::TEXT_SUBTLE, "Right-click for Open / Reveal / Delete.");
+                    ui.colored_label(
+                        theme::TEXT_SUBTLE,
+                        "Right-click for Open / Reveal / Delete.",
+                    );
                     for entry in &data.junk {
                         let icon = if entry.is_dir { "📁" } else { "📄" };
                         let resp = ui.selectable_label(
@@ -1556,8 +1574,7 @@ impl BytewhifferApp {
                         if resp.secondary_clicked() {
                             let mut trail = base.clone();
                             trail.extend(entry.trail.iter().cloned());
-                            self.context_target =
-                                Some((trail, entry.path.clone(), entry.is_dir));
+                            self.context_target = Some((trail, entry.path.clone(), entry.is_dir));
                         }
                         resp.context_menu(|ui| self.context_menu_contents(ui));
                     }
@@ -1591,11 +1608,32 @@ impl BytewhifferApp {
         }
     }
 
-    /// The Turbo toggle's current state, derived from the cached capability
-    /// check for the current target and whether this process is elevated. See
-    /// [`TurboState`].
+    fn requested_target_candidate(&self) -> Option<PathBuf> {
+        let typed = self.path_input.trim();
+        if typed.is_empty() {
+            self.requested_target.clone()
+        } else {
+            Some(normalize_target(PathBuf::from(typed)))
+        }
+    }
+
+    fn resolve_requested_target(&mut self) -> Option<PathBuf> {
+        let target = self.requested_target_candidate()?;
+        self.requested_target = Some(target.clone());
+        self.turbo_availability = Some(MftEngine.is_available(&target));
+        Some(target)
+    }
+
+    /// The Turbo toggle's current state, derived from the current requested
+    /// target rather than historical scan output. Typed input is resolved for
+    /// this action path so capability checks cannot stay stale when the user
+    /// changes drives before elevating.
     fn turbo_state(&self) -> TurboState {
-        match self.turbo_availability {
+        let availability = self
+            .requested_target_candidate()
+            .map(|target| MftEngine.is_available(&target))
+            .or(self.turbo_availability);
+        match availability {
             // No scan has run yet, so the NTFS check hasn't happened at all —
             // assume the common case (NTFS) rather than greying the toggle out
             // pre-emptively. `start_scan` re-derives the real availability on
@@ -1665,10 +1703,7 @@ impl BytewhifferApp {
     /// (unelevated) process so the fresh elevated one takes over; declining UAC
     /// leaves this process running unchanged (the toggle returns to promptable).
     fn trigger_elevation(&mut self, ctx: &egui::Context) {
-        let root = self.last_scanned_path.clone().or_else(|| {
-            let t = self.path_input.trim();
-            (!t.is_empty()).then(|| PathBuf::from(t))
-        });
+        let root = self.resolve_requested_target();
         let Some(root) = root else {
             self.error = Some("Pick a folder to scan before enabling Turbo mode.".to_owned());
             return;
@@ -1758,8 +1793,8 @@ impl BytewhifferApp {
         // Live mode: capture while the scan is still in flight, once enough
         // has streamed in that the map is visibly partial-but-populated.
         if mode == DebugShotMode::Live {
-            if let Some(scan) = &self.scan {
-                let files = scan.ctx.progress.files_scanned.load(Ordering::Relaxed);
+            if let Some(progress) = self.scan_controller.current_progress() {
+                let files = progress.files_scanned.load(Ordering::Relaxed);
                 let shot = self.debug_shot.as_mut().unwrap();
                 if files > 500 && !shot.requested {
                     shot.requested = true;
@@ -1776,7 +1811,10 @@ impl BytewhifferApp {
         // Also wait out the resumable authoritative-tree assembly — the
         // "Final"/"Drill" captures should show the finished tree, not a
         // still-live one mid-swap.
-        if self.scan.is_none() && self.pending_assembly.is_none() && self.root.is_some() {
+        if !self.scan_controller.is_active()
+            && self.pending_assembly.is_none()
+            && self.root.is_some()
+        {
             if mode == DebugShotMode::Drill && !self.debug_shot.as_ref().unwrap().drilled {
                 // Focus the root's largest directory child, as a click would.
                 if let Some(root) = &self.root {
@@ -1799,9 +1837,7 @@ impl BytewhifferApp {
             // A few settle frames so the final tree has actually rendered.
             if shot.frames_after_done >= 3 && !shot.requested {
                 shot.requested = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
-                    egui::UserData::default(),
-                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
         }
     }
@@ -1819,7 +1855,7 @@ impl eframe::App for BytewhifferApp {
         }
         self.drain_scan();
         self.advance_pending_assembly();
-        if self.scan.is_some() || self.pending_assembly.is_some() {
+        if self.scan_controller.is_active() || self.pending_assembly.is_some() {
             // Keep repainting while the scan streams events, or the
             // authoritative tree is still assembling in the background, so
             // both visibly progress without waiting for input.
@@ -1886,7 +1922,11 @@ fn to_insight(node: &Node) -> insights::InsightNode<'_> {
 /// click-to-drill only ever focuses directories.
 fn focus_for(base: &[String], trail: &[String], is_dir: bool) -> Vec<String> {
     let mut f = base.to_vec();
-    let take = if is_dir { trail.len() } else { trail.len().saturating_sub(1) };
+    let take = if is_dir {
+        trail.len()
+    } else {
+        trail.len().saturating_sub(1)
+    };
     f.extend(trail[..take].iter().cloned());
     f
 }
@@ -1984,7 +2024,12 @@ fn size_label_fits(painter: &egui::Painter, block: Rect, size_str: &str) -> bool
 /// chain (`collapse_chain`) can produce a joined name long enough to consume
 /// most of the header on its own, so the tray gate has to account for that
 /// specific label's width rather than assume a short single name.
-fn tray_size_label_fits(painter: &egui::Painter, header_width: f32, label: &str, size_str: &str) -> bool {
+fn tray_size_label_fits(
+    painter: &egui::Painter,
+    header_width: f32,
+    label: &str,
+    size_str: &str,
+) -> bool {
     let font = FontId::proportional(LABEL_FONT_SIZE);
     let label_width = painter
         .layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT)
@@ -2013,6 +2058,7 @@ fn tray_size_label_fits(painter: &egui::Painter, header_width: f32, label: &str,
 /// tessellation steps — so a viewport packed with hundreds of cards stays cheap
 /// enough that hover/pointer tracking doesn't fall behind the cursor. Trays are
 /// already cheap (flat fill + stroke + header) and render the same either way.
+#[allow(clippy::too_many_arguments)]
 fn draw_children(
     painter: &egui::Painter,
     node: &Node,
@@ -2083,7 +2129,14 @@ fn draw_children(
             // branches, using its name for the frame's identity color.
             let (chain, effective) = collapse_chain(child);
             let label = chain.join(" / ");
-            draw_tray_shell(painter, block, &label, &effective.name, depth, effective.size);
+            draw_tray_shell(
+                painter,
+                block,
+                &label,
+                &effective.name,
+                depth,
+                effective.size,
+            );
 
             let chain_len = chain.len();
             for name in chain {
@@ -2107,13 +2160,23 @@ fn draw_children(
                 Pos2::new(block.left() + inset, block.top() + DIR_LABEL_H + inset),
                 Pos2::new(block.right() - inset, block.bottom() - inset),
             );
-            draw_children(painter, effective, inner, depth + 1, trail, hits, dense, gate);
+            draw_children(
+                painter,
+                effective,
+                inner,
+                depth + 1,
+                trail,
+                hits,
+                dense,
+                gate,
+            );
 
             for _ in 0..chain_len {
                 trail.pop();
             }
         } else {
-            let base = theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
+            let base =
+                theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
             if card_eligible && !dense {
                 paint_card(painter, block, base);
             } else if card_eligible {
@@ -2336,7 +2399,12 @@ fn gradient_mesh(rect: Rect, radius: f32, top: egui::Color32, bottom: egui::Colo
 /// depth-shifted) fill colour. The shadow is a parameter so treemap cards and
 /// chrome can each pass a shadow scaled to their own element size while sharing
 /// the identical gradient/radius/outline treatment.
-fn paint_elevated(painter: &egui::Painter, rect: Rect, base: egui::Color32, shadow: egui::epaint::Shadow) {
+fn paint_elevated(
+    painter: &egui::Painter,
+    rect: Rect,
+    base: egui::Color32,
+    shadow: egui::epaint::Shadow,
+) {
     painter.add(shadow.as_shape(rect, theme::CARD_CORNER_RADIUS));
     let (top, bottom) = theme::gradient_stops(base);
     painter.add(egui::Shape::mesh(gradient_mesh(
@@ -2389,7 +2457,11 @@ fn chrome_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response
         .painter()
         .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
     let size = galley.size() + pad * 2.0;
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(size, sense);
 
     if ui.is_rect_visible(rect) {
@@ -2398,7 +2470,10 @@ fn chrome_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response
         let (base, text_color) = if !enabled {
             (theme::CHROME_BASE.gamma_multiply(0.5), theme::TEXT_SUBTLE)
         } else if held {
-            (theme::ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.2), theme::BG)
+            (
+                theme::ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.2),
+                theme::BG,
+            )
         } else if hot {
             (theme::ACCENT, theme::BG)
         } else {
@@ -2427,7 +2502,11 @@ fn turbo_toggle(ui: &mut egui::Ui, text: &str, state: TurboState) -> egui::Respo
         .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
     let size = galley.size() + pad * 2.0;
     let clickable = !matches!(state, TurboState::Disabled);
-    let sense = if clickable { Sense::click() } else { Sense::hover() };
+    let sense = if clickable {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(size, sense);
 
     if ui.is_rect_visible(rect) {
@@ -2452,7 +2531,9 @@ fn turbo_toggle(ui: &mut egui::Ui, text: &str, state: TurboState) -> egui::Respo
             }
         };
         paint_surface(ui.painter(), rect, base);
-        let tg = ui.painter().layout_no_wrap(text.to_owned(), font, text_color);
+        let tg = ui
+            .painter()
+            .layout_no_wrap(text.to_owned(), font, text_color);
         let pos = rect.center() - tg.size() / 2.0;
         ui.painter().galley(pos, tg, text_color);
     }
@@ -2478,7 +2559,11 @@ fn chrome_chip(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
         } else {
             theme::CHROME_BASE
         };
-        let text_color = if accent { theme::BG } else { theme::TEXT_SUBTLE };
+        let text_color = if accent {
+            theme::BG
+        } else {
+            theme::TEXT_SUBTLE
+        };
         paint_surface(ui.painter(), rect, base);
         let tg = ui
             .painter()
@@ -2510,7 +2595,10 @@ pub fn run_perf_bench() {
     // Adversarial worst case for the elevation cost: hundreds of similarly
     // sized blocks all above the card threshold, so almost nothing falls back
     // to flat and the shadow/gradient cost is paid on every block.
-    bench_scene("all-cards (400 equal mid-size files)", synth_all_cards_tree());
+    bench_scene(
+        "all-cards (400 equal mid-size files)",
+        synth_all_cards_tree(),
+    );
 }
 
 /// Lays out one scene, then tessellates the flat baseline and the elevation
@@ -2693,7 +2781,11 @@ fn build_elevated_shapes(blocks: &[BenchBlock], clip: Rect) -> Vec<egui::epaint:
         } else if b.is_dir && b.nestable {
             let border = theme::dir_frame_border_color("dir", b.depth);
             let fill = theme::dir_frame_fill_color(border);
-            push(egui::Shape::rect_filled(b.rect, theme::TRAY_CORNER_RADIUS, fill));
+            push(egui::Shape::rect_filled(
+                b.rect,
+                theme::TRAY_CORNER_RADIUS,
+                fill,
+            ));
             push(egui::Shape::rect_stroke(
                 b.rect,
                 theme::TRAY_CORNER_RADIUS,
@@ -2710,7 +2802,11 @@ fn build_elevated_shapes(blocks: &[BenchBlock], clip: Rect) -> Vec<egui::epaint:
                 theme::tray_header_color("dir", b.depth),
             ));
         } else {
-            push(theme::card_shadow().as_shape(b.rect, theme::CARD_CORNER_RADIUS).into());
+            push(
+                theme::card_shadow()
+                    .as_shape(b.rect, theme::CARD_CORNER_RADIUS)
+                    .into(),
+            );
             let (top, bottom) = theme::gradient_stops(base);
             push(egui::Shape::mesh(gradient_mesh(
                 b.rect,
@@ -2764,15 +2860,27 @@ fn synth_dense_tree() -> Entry {
     let installers = dir(
         "Installers",
         (0..14)
-            .map(|i| file(format!("setup{i}.exe"), 200_000_000 + (i as u64) * 90_000_000))
+            .map(|i| {
+                file(
+                    format!("setup{i}.exe"),
+                    200_000_000 + (i as u64) * 90_000_000,
+                )
+            })
             .collect(),
     );
     // A dense ~30-file mosaic of similar mid-size files.
     let downloads = dir(
         "Downloads",
         (0..30)
-            .map(|i| file(format!("clip{i}.mp4"), 6_000_000 + (i as u64 % 5) * 1_000_000))
-            .chain((0..8).map(|i| file(format!("iso{i}.iso"), 700_000_000 + (i as u64) * 30_000_000)))
+            .map(|i| {
+                file(
+                    format!("clip{i}.mp4"),
+                    6_000_000 + (i as u64 % 5) * 1_000_000,
+                )
+            })
+            .chain(
+                (0..8).map(|i| file(format!("iso{i}.iso"), 700_000_000 + (i as u64) * 30_000_000)),
+            )
             .collect(),
     );
     // Nested app dirs (depth) with mixed small files.
@@ -2803,7 +2911,12 @@ fn synth_dense_tree() -> Entry {
     );
 
     let mut loose: Vec<Entry> = (0..8)
-        .map(|i| file(format!("archive{i}.zip"), 1_200_000_000 + (i as u64) * 200_000_000))
+        .map(|i| {
+            file(
+                format!("archive{i}.zip"),
+                1_200_000_000 + (i as u64) * 200_000_000,
+            )
+        })
         .collect();
     loose.extend([
         dir("Windows", vec![system32]),
@@ -2852,7 +2965,10 @@ mod abstraction_tests {
     #[test]
     fn abstract_end_drops_depth_to_the_floor_and_scales_size_up() {
         let gate = resolve_nest_gate(1.0);
-        assert_eq!(gate.max_depth, 1, "full abstract must cap depth at its floor of 1");
+        assert_eq!(
+            gate.max_depth, 1,
+            "full abstract must cap depth at its floor of 1"
+        );
         assert_eq!(gate.min_side, MIN_NEST_SIDE * (1.0 + ABSTRACTION_SIDE_GAIN));
         assert_eq!(
             gate.min_area,
@@ -3032,11 +3148,14 @@ mod scan_responsiveness_tests {
         // A near-zero budget forces `step` to bail after every batch of
         // `SCAN_BUDGET_CHECK_INTERVAL` items, simulating many small frames
         // rather than one big one.
-        let mut assembly = PendingAssembly::start(tree);
+        let mut assembly = PendingAssembly::start_for(0, tree);
         let mut frames = 0usize;
         loop {
             frames += 1;
-            assert!(frames < 10_000, "assembly should finish well before this many frames");
+            assert!(
+                frames < 10_000,
+                "assembly should finish well before this many frames"
+            );
             if assembly.step(Duration::from_nanos(1)) {
                 break;
             }
@@ -3057,7 +3176,7 @@ mod scan_responsiveness_tests {
         let tree = build_entry_tree("root", 2, 3);
         let reference = Node::from_entry(&tree);
 
-        let mut assembly = PendingAssembly::start(tree);
+        let mut assembly = PendingAssembly::start_for(0, tree);
         assert!(
             assembly.step(SCAN_FRAME_BUDGET),
             "a small tree should assemble within the normal per-frame budget in one call"
@@ -3068,7 +3187,7 @@ mod scan_responsiveness_tests {
     #[test]
     fn assembly_progress_rises_monotonically_to_one() {
         let tree = build_entry_tree("root", 4, 5); // needs several simulated frames
-        let mut assembly = PendingAssembly::start(tree);
+        let mut assembly = PendingAssembly::start_for(0, tree);
         assert!(
             assembly.progress() < 1.0,
             "freshly-started assembly with queued work should not already read complete"
@@ -3087,7 +3206,11 @@ mod scan_responsiveness_tests {
                 break;
             }
         }
-        assert_eq!(assembly.progress(), 1.0, "a finished assembly reads as fully complete");
+        assert_eq!(
+            assembly.progress(),
+            1.0,
+            "a finished assembly reads as fully complete"
+        );
     }
 
     #[test]
@@ -3099,13 +3222,104 @@ mod scan_responsiveness_tests {
             is_dir: true,
             children: Vec::new(),
         };
-        let assembly = PendingAssembly::start(tree);
+        let assembly = PendingAssembly::start_for(0, tree);
         assert_eq!(
             assembly.progress(),
             1.0,
             "nothing queued means nothing left to finish"
         );
     }
+}
+
+#[cfg(test)]
+mod scan_lifecycle_ui_tests {
+    use super::*;
+
+    struct ImmediateEngine;
+
+    impl ScanEngine for ImmediateEngine {
+        fn name(&self) -> &'static str {
+            "ui-test"
+        }
+
+        fn is_available(&self, _target: &Path) -> Availability {
+            Availability::Available
+        }
+
+        fn scan(&self, target: &Path, _ctx: &crate::scanner::ScanContext) -> ScanOutcome {
+            ScanOutcome::Success(Entry {
+                name: "root".to_owned(),
+                path: target.to_path_buf(),
+                size: 0,
+                is_dir: true,
+                children: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn typed_target_overrides_historical_scan_path() {
+        let mut app = BytewhifferApp::new();
+        app.last_scanned_path = Some(PathBuf::from("historical"));
+        app.requested_target = Some(PathBuf::from("old-request"));
+        app.path_input = "typed-folder".to_owned();
+
+        assert_eq!(
+            app.resolve_requested_target(),
+            Some(PathBuf::from("typed-folder"))
+        );
+    }
+
+    #[test]
+    fn rescan_candidate_uses_requested_target_when_input_is_empty() {
+        let mut app = BytewhifferApp::new();
+        app.last_scanned_path = Some(PathBuf::from("historical"));
+        app.requested_target = Some(PathBuf::from("requested"));
+        app.path_input.clear();
+
+        assert_eq!(
+            app.resolve_requested_target(),
+            Some(PathBuf::from("requested"))
+        );
+    }
+
+    #[test]
+    fn delete_is_gated_during_scan_and_authoritative_assembly() {
+        let mut app = BytewhifferApp::new();
+        app.scan_controller
+            .start(PathBuf::from("scan"), Box::new(ImmediateEngine));
+        assert!(!app.delete_available());
+        app.scan_controller.cancel_current();
+
+        for _ in 0..1000 {
+            if app.scan_controller.poll_completion().is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        app.scan_generation = Some(7);
+        app.pending_assembly = Some(PendingAssembly::start_for(
+            7,
+            Entry {
+                name: "root".to_owned(),
+                path: PathBuf::from("root"),
+                size: 0,
+                is_dir: true,
+                children: Vec::new(),
+            },
+        ));
+        assert!(!app.delete_available());
+        app.pending_assembly = None;
+        assert!(app.delete_available());
+    }
+}
+
+/// Normalizes one action target without using historical scan state as a
+/// fallback. Existing targets are left as-is so invalid paths still reach the
+/// scanner and produce the normal root-readable error.
+fn normalize_target(path: PathBuf) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().trim())
 }
 
 /// Opens the system file manager with `path` selected. On Windows this is

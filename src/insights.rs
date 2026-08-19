@@ -127,7 +127,7 @@ impl<'a> InsightNode<'a> {
         }
         let mut out = Vec::new();
         walk(self, &mut Vec::new(), &mut out);
-        out.sort_by(|a, b| b.size.cmp(&a.size));
+        out.sort_by_key(|b| std::cmp::Reverse(b.size));
         out.truncate(n);
         out
     }
@@ -160,7 +160,7 @@ impl<'a> InsightNode<'a> {
         }
         let mut out = Vec::new();
         walk(self, &mut Vec::new(), &mut out);
-        out.sort_by(|a, b| b.child_count.cmp(&a.child_count));
+        out.sort_by_key(|b| std::cmp::Reverse(b.child_count));
         out
     }
 
@@ -191,7 +191,7 @@ impl<'a> InsightNode<'a> {
         }
         let mut out = Vec::new();
         walk(self, &mut Vec::new(), &mut out);
-        out.sort_by(|a, b| b.size.cmp(&a.size));
+        out.sort_by_key(|b| std::cmp::Reverse(b.size));
         out
     }
 }
@@ -299,8 +299,10 @@ mod tests {
         // "big" (900) ranks above its own child "huge.bin" (900) only by
         // insertion tie order, but both outrank mid (100) and small (10).
         let names: Vec<&str> = board.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names[0..2].iter().collect::<std::collections::HashSet<_>>(),
-                   ["big", "huge.bin"].iter().collect());
+        assert_eq!(
+            names[0..2].iter().collect::<std::collections::HashSet<_>>(),
+            ["big", "huge.bin"].iter().collect()
+        );
         assert!(board.iter().all(|e| e.size >= 100));
         // The nested file's trail is relative to the focus node.
         let huge = board.iter().find(|e| e.name == "huge.bin").unwrap();
@@ -325,7 +327,9 @@ mod tests {
         );
         let normal = dir(
             "media",
-            (0..3).map(|i| file(&format!("v{i}.mp4"), 500_000_000)).collect(),
+            (0..3)
+                .map(|i| file(&format!("v{i}.mp4"), 500_000_000))
+                .collect(),
         );
         let tree = dir("root", vec![clutter, normal]);
         let flags = InsightNode::from_entry(&tree).blizzard_flags();
@@ -340,7 +344,9 @@ mod tests {
         // 120 children, but each is large, so average is well over the cap.
         let big = dir(
             "assets",
-            (0..120).map(|i| file(&format!("a{i}.bin"), 10 * 1024 * 1024)).collect(),
+            (0..120)
+                .map(|i| file(&format!("a{i}.bin"), 10 * 1024 * 1024))
+                .collect(),
         );
         let tree = dir("root", vec![big]);
         assert!(InsightNode::from_entry(&tree).blizzard_flags().is_empty());
@@ -363,10 +369,18 @@ mod tests {
         let names: Vec<&str> = junk.iter().map(|e| e.name.as_str()).collect();
         // Matched: node_modules, target, setup_v2.exe, game.msi. Sorted by
         // size descending.
-        assert_eq!(names, vec!["setup_v2.exe", "game.msi", "target", "node_modules"]);
-        assert!(!junk.iter().any(|e| e.name == "src" || e.name == "photo.jpg"));
         assert_eq!(
-            junk.iter().find(|e| e.name == "node_modules").unwrap().category,
+            names,
+            vec!["setup_v2.exe", "game.msi", "target", "node_modules"]
+        );
+        assert!(!junk
+            .iter()
+            .any(|e| e.name == "src" || e.name == "photo.jpg"));
+        assert_eq!(
+            junk.iter()
+                .find(|e| e.name == "node_modules")
+                .unwrap()
+                .category,
             "node_modules"
         );
     }

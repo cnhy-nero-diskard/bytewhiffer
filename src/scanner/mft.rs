@@ -61,10 +61,10 @@ mod attr {
     pub const LENGTH: usize = 0x04; // u32: total attribute length (advance by this)
     pub const NON_RESIDENT: usize = 0x08; // u8: 0 = resident, 1 = non-resident
     pub const NAME_LENGTH: usize = 0x09; // u8: name length in UTF-16 units
-    // Resident:
+                                         // Resident:
     pub const RES_VALUE_LENGTH: usize = 0x10; // u32
     pub const RES_VALUE_OFFSET: usize = 0x14; // u16
-    // Non-resident:
+                                              // Non-resident:
     pub const NONRES_REAL_SIZE: usize = 0x30; // u64: actual data size
 }
 
@@ -127,9 +127,8 @@ fn le_u32(b: &[u8], off: usize) -> Option<u32> {
 }
 
 fn le_u64(b: &[u8], off: usize) -> Option<u64> {
-    b.get(off..off + 8).map(|s| {
-        u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
-    })
+    b.get(off..off + 8)
+        .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
 }
 
 /// A file reference is a 64-bit value whose low 48 bits are the record number
@@ -228,7 +227,7 @@ pub(crate) fn apply_fixups(buf: &mut [u8]) -> bool {
     }
     // Prefer the sector size implied by the record length; fall back to the
     // hardware default if it doesn't divide evenly.
-    let sector_size = if buf.len() % sectors == 0 {
+    let sector_size = if buf.len().is_multiple_of(sectors) {
         buf.len() / sectors
     } else {
         DEFAULT_SECTOR_SIZE
@@ -491,6 +490,7 @@ pub(crate) fn parse_data_runs(b: &[u8]) -> Vec<DataRun> {
 /// Finds the unnamed non-resident `$DATA` attribute in a (fixed-up) FILE record
 /// and returns its decoded data runs. Used to locate the `$MFT`'s own fragments
 /// from record 0. Returns an empty vec if `$DATA` is resident or absent.
+#[allow(clippy::while_let_loop)]
 pub(crate) fn data_runs_of(buf: &[u8]) -> Vec<DataRun> {
     let Some(mut off) = le_u16(buf, rec::FIRST_ATTR_OFFSET).map(|v| v as usize) else {
         return Vec::new();
@@ -568,10 +568,14 @@ pub(crate) fn reconstruct(
             continue; // the root's own parent link is irrelevant
         }
         if let Some(name) = r.best_name() {
-            children_of.entry(name.parent).or_default().push(r.record_number);
+            children_of
+                .entry(name.parent)
+                .or_default()
+                .push(r.record_number);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         num: u64,
         name: String,
@@ -686,11 +690,7 @@ impl super::ScanEngine for MftEngine {
         resolve_availability(volume_is_ntfs(target), process_is_elevated())
     }
 
-    fn scan(
-        &self,
-        target: &Path,
-        ctx: &super::ScanContext,
-    ) -> Result<Entry, super::ScanError> {
+    fn scan(&self, target: &Path, ctx: &super::ScanContext) -> super::ScanOutcome {
         platform::scan(target, ctx)
     }
 }
@@ -773,7 +773,7 @@ mod platform {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
-    use crate::scanner::{Entry, ScanContext, ScanError};
+    use crate::scanner::{Entry, ScanContext, ScanError, ScanOutcome};
 
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -845,7 +845,10 @@ mod platform {
             .is_ok()
         }
         .then(|| {
-            let end = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
+            let end = fs_name
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(fs_name.len());
             String::from_utf16_lossy(&fs_name[..end])
         })
         .map(|name| name.eq_ignore_ascii_case("NTFS"))
@@ -971,18 +974,20 @@ mod platform {
         node
     }
 
-    pub fn scan(target: &Path, ctx: &ScanContext) -> Result<Entry, ScanError> {
+    pub fn scan(target: &Path, ctx: &ScanContext) -> ScanOutcome {
         // Guard the capability contract: only run on elevated + NTFS.
         match resolve_availability(volume_is_ntfs(target), process_is_elevated()) {
             Availability::Available => {}
             other => {
                 ctx.progress.mark_complete();
-                return Err(ScanError::Unavailable(other));
+                return ScanOutcome::Failed(ScanError::Unavailable(other));
             }
         }
         let Some(drive) = drive_of(target) else {
             ctx.progress.mark_complete();
-            return Err(ScanError::Unavailable(Availability::UnsupportedFilesystem));
+            return ScanOutcome::Failed(ScanError::Unavailable(
+                Availability::UnsupportedFilesystem,
+            ));
         };
 
         let read_result = (|| {
@@ -993,13 +998,13 @@ mod platform {
             Ok(v) => v,
             Err(err) => {
                 ctx.progress.mark_complete();
-                return Err(ScanError::RootUnreadable(err));
+                return ScanOutcome::Failed(ScanError::RootUnreadable(err));
             }
         };
 
-        if ctx.cancel.load(Ordering::Relaxed) {
+        if ctx.is_cancelled() {
             ctx.progress.mark_complete();
-            return Ok(empty_root(target));
+            return ScanOutcome::Cancelled;
         }
 
         // Parse every fixed-size record in parallel. Records are independent
@@ -1009,7 +1014,7 @@ mod platform {
         let records: Vec<ParsedRecord> = (0..count)
             .into_par_iter()
             .filter_map(|i| {
-                if ctx.cancel.load(Ordering::Relaxed) {
+                if ctx.is_cancelled() {
                     return None;
                 }
                 let start = i * record_size;
@@ -1021,9 +1026,9 @@ mod platform {
             })
             .collect();
 
-        if ctx.cancel.load(Ordering::Relaxed) {
+        if ctx.is_cancelled() {
             ctx.progress.mark_complete();
-            return Ok(empty_root(target));
+            return ScanOutcome::Cancelled;
         }
 
         // Reconstruct the whole volume from the root directory, then carve out
@@ -1039,24 +1044,12 @@ mod platform {
         subtree.sort_children_recursive();
 
         tally(&subtree, ctx);
-        ctx.progress.mark_complete();
-        Ok(subtree)
-    }
-
-    /// An empty directory node for `target`, used for a cancelled scan's
-    /// partial result.
-    fn empty_root(target: &Path) -> Entry {
-        let name = target
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| target.to_string_lossy().into_owned());
-        Entry {
-            name,
-            path: target.to_path_buf(),
-            size: 0,
-            is_dir: true,
-            children: Vec::new(),
+        if ctx.is_cancelled() {
+            ctx.progress.mark_complete();
+            return ScanOutcome::Cancelled;
         }
+        ctx.progress.mark_complete();
+        ScanOutcome::Success(subtree)
     }
 
     /// Populates the progress counters from the finished tree in one walk. This
@@ -1083,7 +1076,7 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::*;
-    use crate::scanner::{Entry, ScanContext, ScanError};
+    use crate::scanner::{Entry, ScanContext, ScanError, ScanOutcome};
     use std::path::Path;
 
     pub fn process_is_elevated() -> bool {
@@ -1098,9 +1091,9 @@ mod platform {
         Ok(false)
     }
 
-    pub fn scan(_target: &Path, ctx: &ScanContext) -> Result<Entry, ScanError> {
+    pub fn scan(_target: &Path, ctx: &ScanContext) -> ScanOutcome {
         ctx.progress.mark_complete();
-        Err(ScanError::Unavailable(Availability::UnsupportedFilesystem))
+        ScanOutcome::Failed(ScanError::Unavailable(Availability::UnsupportedFilesystem))
     }
 }
 
@@ -1180,12 +1173,14 @@ mod tests {
         let usa_count = (sectors + 1) as u16;
         buf[rec::USA_OFFSET..rec::USA_OFFSET + 2].copy_from_slice(&(usa_off as u16).to_le_bytes());
         buf[rec::USA_COUNT..rec::USA_COUNT + 2].copy_from_slice(&usa_count.to_le_bytes());
-        buf[rec::HARD_LINK_COUNT..rec::HARD_LINK_COUNT + 2].copy_from_slice(&hard_links.to_le_bytes());
+        buf[rec::HARD_LINK_COUNT..rec::HARD_LINK_COUNT + 2]
+            .copy_from_slice(&hard_links.to_le_bytes());
         let first_attr = 0x38usize;
         buf[rec::FIRST_ATTR_OFFSET..rec::FIRST_ATTR_OFFSET + 2]
             .copy_from_slice(&(first_attr as u16).to_le_bytes());
         buf[rec::FLAGS..rec::FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
-        buf[rec::BASE_RECORD_REF..rec::BASE_RECORD_REF + 8].copy_from_slice(&base_ref.to_le_bytes());
+        buf[rec::BASE_RECORD_REF..rec::BASE_RECORD_REF + 8]
+            .copy_from_slice(&base_ref.to_le_bytes());
 
         // Lay attributes down, then the end marker.
         let mut off = first_attr;
@@ -1275,7 +1270,7 @@ mod tests {
             0,
             &[
                 file_name_attr(5, "f.bin", 1, 0),
-                nonresident_data_attr(0, 1000), // unnamed
+                nonresident_data_attr(0, 1000),      // unnamed
                 nonresident_data_attr(4, 9_999_999), // ADS
             ],
         );
@@ -1373,8 +1368,20 @@ mod tests {
         let bytes = [0x21, 0x18, 0x00, 0x01, 0x11, 0x08, 0x02, 0x00];
         let runs = parse_data_runs(&bytes);
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0], DataRun { lcn: 0x0100, cluster_count: 0x18 });
-        assert_eq!(runs[1], DataRun { lcn: 0x0102, cluster_count: 0x08 });
+        assert_eq!(
+            runs[0],
+            DataRun {
+                lcn: 0x0100,
+                cluster_count: 0x18
+            }
+        );
+        assert_eq!(
+            runs[1],
+            DataRun {
+                lcn: 0x0102,
+                cluster_count: 0x08
+            }
+        );
     }
 
     #[test]
@@ -1427,7 +1434,7 @@ mod tests {
         fn check(e: &Entry) -> u64 {
             if e.is_dir {
                 let sum: u64 = e.children.iter().map(check).sum();
-                assert_eq!(e.size, sum + 0, "dir {} size == sum of children", e.name);
+                assert_eq!(e.size, sum, "dir {} size == sum of children", e.name);
                 e.size
             } else {
                 e.size
@@ -1456,7 +1463,10 @@ mod tests {
     fn deleted_records_are_excluded() {
         let mut recs = sample_volume();
         // Mark b.txt (record 19) deleted-but-unreclaimed.
-        recs.iter_mut().find(|r| r.record_number == 19).unwrap().in_use = false;
+        recs.iter_mut()
+            .find(|r| r.record_number == 19)
+            .unwrap()
+            .in_use = false;
         let tree = reconstruct(&recs, ROOT_RECORD, "C:\\".into(), "C:\\".into());
         assert!(tree.children.iter().all(|c| c.name != "b.txt"));
         assert_eq!(tree.size, 500); // only Docs now
@@ -1488,7 +1498,11 @@ mod tests {
         // Give a.txt (17) a second name under root as well; hard_link_count=2.
         let a = recs.iter_mut().find(|r| r.record_number == 17).unwrap();
         a.hard_link_count = 2;
-        a.names.push(FileNameEntry { parent: 5, name: "a-link.txt".into(), namespace: 1 });
+        a.names.push(FileNameEntry {
+            parent: 5,
+            name: "a-link.txt".into(),
+            namespace: 1,
+        });
         let tree = reconstruct(&recs, ROOT_RECORD, "C:\\".into(), "C:\\".into());
         // Total unchanged (a.txt still 100, counted once): Docs(500)+b(50)=550.
         assert_eq!(tree.size, 550);
