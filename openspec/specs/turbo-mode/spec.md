@@ -3,6 +3,26 @@
 ## Purpose
 TBD - created by archiving change add-ntfs-turbo-mode. Update Purpose after archive.
 ## Requirements
+### Requirement: Requested scan target is authoritative
+The system SHALL maintain one current requested scan target and SHALL use it
+consistently for Scan, Rescan, engine capability checks, and Turbo elevation
+handoff.
+
+#### Scenario: Typed target supersedes historical scan path
+- **WHEN** the user scanned folder A, enters folder B, and invokes Turbo
+  elevation for B
+- **THEN** the elevation flow receives B and does not prefer the historical
+  path A
+
+#### Scenario: Rescan uses the current requested target
+- **WHEN** the current requested target is B and the user invokes Rescan
+- **THEN** the new generation scans B
+
+#### Scenario: Capability check matches requested target
+- **WHEN** the requested target changes between filesystems
+- **THEN** Turbo availability is recomputed for that target before engine
+  selection or elevation
+
 ### Requirement: Turbo toggle reflects engine availability
 The system SHALL render a Turbo toggle in the toolbar whose visual state
 tracks the MFT engine's capability check for the current scan target:
