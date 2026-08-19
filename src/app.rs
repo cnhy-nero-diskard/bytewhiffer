@@ -1609,10 +1609,19 @@ impl BytewhifferApp {
     fn requested_target_candidate(&self) -> Option<PathBuf> {
         let typed = self.path_input.trim();
         if typed.is_empty() {
-            self.requested_target.clone()
-        } else {
-            Some(PathBuf::from(typed))
+            return self.requested_target.clone();
         }
+        if let Some(target) = &self.requested_target {
+            // `path_input` still shows exactly the display text a prior
+            // start_scan/picker/turbo-elevation action wrote for `target` —
+            // no user edit has happened since. Return the stored PathBuf
+            // instead of reparsing its (possibly lossy) display rendering,
+            // so a picker/CLI path survives Rescan/Turbo unchanged.
+            if target.display().to_string() == self.path_input {
+                return Some(target.clone());
+            }
+        }
+        Some(PathBuf::from(typed))
     }
 
     fn resolve_requested_target(&mut self) -> Option<PathBuf> {
@@ -3279,6 +3288,59 @@ mod scan_lifecycle_ui_tests {
             app.resolve_requested_target(),
             Some(PathBuf::from("requested"))
         );
+    }
+
+    /// After `start_scan` (picker/CLI target), `path_input` mirrors the
+    /// target's display text untouched — a later Rescan/Turbo action must
+    /// return the exact stored `PathBuf` rather than reparsing that display
+    /// text, or a picker/CLI path would be silently re-lossified on every
+    /// follow-up action.
+    #[test]
+    fn rescan_after_start_scan_reuses_the_exact_stored_target() {
+        let mut app = BytewhifferApp::new();
+        app.start_scan(PathBuf::from("picked-folder"));
+
+        assert_eq!(
+            app.resolve_requested_target(),
+            Some(PathBuf::from("picked-folder"))
+        );
+    }
+
+    /// Once the user edits the path field after a scan, the field no longer
+    /// mirrors the stored target's display text, so the typed text (not the
+    /// stale stored target) must win.
+    #[test]
+    fn editing_the_field_after_a_scan_overrides_the_stored_target() {
+        let mut app = BytewhifferApp::new();
+        app.start_scan(PathBuf::from("picked-folder"));
+        app.path_input = "edited-folder".to_owned();
+
+        assert_eq!(
+            app.resolve_requested_target(),
+            Some(PathBuf::from("edited-folder"))
+        );
+    }
+
+    /// The regression this guards against only bites on paths that aren't
+    /// exactly representable in valid Unicode: a lone UTF-16 surrogate,
+    /// which `Path::display()` replaces with U+FFFD. Reparsing that display
+    /// text would silently change the target; the stored `PathBuf` must be
+    /// reused unchanged instead.
+    #[test]
+    #[cfg(windows)]
+    fn rescan_after_start_scan_preserves_a_non_unicode_path() {
+        use std::os::windows::ffi::OsStringExt;
+
+        // A lone high surrogate (0xD800) is not valid UTF-16 on its own and
+        // has no lossless UTF-8 representation.
+        let wide: Vec<u16> = "C:\\".encode_utf16().chain([0xD800, 'x' as u16]).collect();
+        let lossy_path = PathBuf::from(std::ffi::OsString::from_wide(&wide));
+        assert_ne!(lossy_path, PathBuf::from(lossy_path.display().to_string()));
+
+        let mut app = BytewhifferApp::new();
+        app.start_scan(lossy_path.clone());
+
+        assert_eq!(app.resolve_requested_target(), Some(lossy_path));
     }
 
     #[test]
