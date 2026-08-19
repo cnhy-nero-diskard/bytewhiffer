@@ -5,14 +5,17 @@ on:
     tags:
       - 'v*'
 
-jobs:
-  build:
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
+permissions:
+  contents: read
 
+jobs:
+  validate-tag:
+    name: Validate Tag
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
       - name: Verify tag matches Cargo.toml version
         shell: pwsh
         run: |
@@ -22,15 +25,45 @@ jobs:
             throw "Tag v$tag does not match Cargo.toml version $cargoVersion"
           }
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
+  quality:
+    name: Quality
+    needs: validate-tag
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: ${{ github.sha }}
+    permissions:
+      contents: read
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+  publish:
+    name: Publish Release
+    needs: [validate-tag, quality]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          files: target/release/bytewhiffer.exe
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Build the validated MSVC release executable
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Create and verify SHA-256 checksum
+        shell: pwsh
+        run: |
+          $artifact = 'target\x86_64-pc-windows-msvc\release\bytewhiffer.exe'
+          $checksum = "$artifact.sha256"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact).Hash.ToLowerInvariant()
+          "$hash *bytewhiffer.exe" | Set-Content -NoNewline -Path $checksum
+          $recordedHash = ((Get-Content -Raw -Path $checksum) -split '\s+')[0]
+          if ($recordedHash -ne $hash) {
+            throw "Checksum verification failed for $artifact"
+          }
+      - name: Create Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            target/x86_64-pc-windows-msvc/release/bytewhiffer.exe
+            target/x86_64-pc-windows-msvc/release/bytewhiffer.exe.sha256
           draft: false
           prerelease: false

@@ -6,51 +6,50 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  gate:
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+  commit-policy:
+    name: Commit Policy
     runs-on: ubuntu-latest
-    outputs:
-      proceed: ${{ steps.check.outputs.proceed }}
     steps:
-      - name: Check commit is a direct push to main or a verified PR merge
-        id: check
+      - name: Reject unverified merge commits on main
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           data=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}")
           parents=$(echo "$data" | jq '.parents | length')
           verified=$(echo "$data" | jq -r '.commit.verification.verified')
-          if [ "$parents" -le 1 ] || [ "$verified" = "true" ]; then
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          if [ "$parents" -gt 1 ] && [ "$verified" != "true" ]; then
+            echo "Unverified merge commits are not accepted on main." >&2
+            exit 1
           fi
 
-  test:
-    needs: gate
-    if: needs.gate.outputs.proceed == 'true'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release
+  quality:
+    name: Quality
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: ${{ github.sha }}
+    permissions:
+      contents: read
 
-  build:
-    needs: gate
-    if: needs.gate.outputs.proceed == 'true'
-    runs-on: windows-latest
+  ci:
+    name: CI
+    if: ${{ always() }}
+    needs: [commit-policy, quality]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
+      - name: Fail closed when commit policy or quality did not succeed
+        shell: bash
+        run: |
+          for result in "${{ needs.commit-policy.result }}" "${{ needs.quality.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "Required CI job finished as '$result'." >&2
+              exit 1
+            fi
+          done

@@ -173,7 +173,12 @@ fn place_row(
 mod tests {
     use super::*;
 
-    const CONTAINER: Rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
+    const CONTAINER: Rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 800.0,
+        h: 600.0,
+    };
 
     #[test]
     fn empty_input_returns_empty_output() {
@@ -260,7 +265,10 @@ mod tests {
         let out = squarify(&sizes, CONTAINER);
         for r in &out {
             let ratio = (r.w / r.h).max(r.h / r.w);
-            assert!(ratio < 6.0, "rect {r:?} has aspect ratio {ratio}, too sliver-y");
+            assert!(
+                ratio < 6.0,
+                "rect {r:?} has aspect ratio {ratio}, too sliver-y"
+            );
         }
     }
 }

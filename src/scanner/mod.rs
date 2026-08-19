@@ -33,7 +33,7 @@ impl Entry {
     /// treemap should lay them out.
     pub fn sort_children_recursive(&mut self) {
         self.children
-            .sort_unstable_by(|a, b| b.size.cmp(&a.size));
+            .sort_unstable_by_key(|b| std::cmp::Reverse(b.size));
         for child in &mut self.children {
             child.sort_children_recursive();
         }

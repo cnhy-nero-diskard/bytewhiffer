@@ -88,7 +88,9 @@ fn scan_dir(path: &Path, name: String, ctx: &ScanContext) -> Entry {
                     let size = dir_entry.metadata().map(|m| m.len()).unwrap_or(0);
                     total += size;
                     ctx.progress.files_scanned.fetch_add(1, Ordering::Relaxed);
-                    ctx.progress.bytes_scanned.fetch_add(size, Ordering::Relaxed);
+                    ctx.progress
+                        .bytes_scanned
+                        .fetch_add(size, Ordering::Relaxed);
                     ctx.emit(ScanEvent::Discovered {
                         path: child_path.clone(),
                         size,
@@ -130,7 +132,7 @@ fn scan_dir(path: &Path, name: String, ctx: &ScanContext) -> Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanner::ScanProgress;
+
     use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;

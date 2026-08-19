@@ -125,7 +125,10 @@ mod tests {
     fn format_duration_live_shows_tenths() {
         assert_eq!(format_duration_live(Duration::from_millis(0)), "0.0s");
         assert_eq!(format_duration_live(Duration::from_millis(9300)), "9.3s");
-        assert_eq!(format_duration_live(Duration::from_millis(65_400)), "1m 05.4s");
+        assert_eq!(
+            format_duration_live(Duration::from_millis(65_400)),
+            "1m 05.4s"
+        );
         assert_eq!(
             format_duration_live(Duration::from_millis(3_725_600)),
             "62m 05.6s"

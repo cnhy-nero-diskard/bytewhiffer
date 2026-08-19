@@ -156,7 +156,8 @@ impl Node {
             Some(&i) => node.children[i].size += size,
             None => {
                 let i = node.children.len();
-                node.children.push(Node::new(leaf.clone(), path, size, is_dir));
+                node.children
+                    .push(Node::new(leaf.clone(), path, size, is_dir));
                 node.child_index.insert(leaf, i);
             }
         }
@@ -190,10 +191,7 @@ impl Node {
     /// proxy for the render-tier decision (see `BytewhifferApp::refresh_density`),
     /// walked once per (focus, tree_rev) change rather than every frame.
     fn descendant_count(&self) -> usize {
-        self.children
-            .iter()
-            .map(|c| 1 + c.descendant_count())
-            .sum()
+        self.children.iter().map(|c| 1 + c.descendant_count()).sum()
     }
 
     /// Removes the node at `names`, subtracting its size from every
@@ -718,11 +716,7 @@ impl BytewhifferApp {
             // `SCAN_BUDGET_CHECK_INTERVAL` events, not per event.
             let started = Instant::now();
             let mut since_check = 0usize;
-            loop {
-                let event = match scan.events.try_recv() {
-                    Ok(event) => event,
-                    Err(_) => break,
-                };
+            while let Ok(event) = scan.events.try_recv() {
                 discovered_any = true;
                 let ScanEvent::Discovered { path, size, is_dir } = event;
                 if let Ok(rel) = path.strip_prefix(&base) {
@@ -734,7 +728,7 @@ impl BytewhifferApp {
                         let is_new_max = self
                             .biggest_top_level
                             .as_ref()
-                            .map_or(true, |(_, max)| total > *max);
+                            .is_none_or(|(_, max)| total > *max);
                         if is_new_max {
                             self.biggest_top_level = Some((top_name, total));
                         }
@@ -1500,7 +1494,11 @@ impl BytewhifferApp {
                             let resp = ui
                                 .selectable_label(
                                     false,
-                                    format!("{icon} {}  ·  {}", entry.name, format_size(entry.size)),
+                                    format!(
+                                        "{icon} {}  ·  {}",
+                                        entry.name,
+                                        format_size(entry.size)
+                                    ),
                                 )
                                 .on_hover_text(entry.path.display().to_string());
                             clicked = resp.clicked();
@@ -1541,7 +1539,10 @@ impl BytewhifferApp {
                 if data.junk.is_empty() {
                     insights_empty(ui, "No known-junk matches.");
                 } else {
-                    ui.colored_label(theme::TEXT_SUBTLE, "Right-click for Open / Reveal / Delete.");
+                    ui.colored_label(
+                        theme::TEXT_SUBTLE,
+                        "Right-click for Open / Reveal / Delete.",
+                    );
                     for entry in &data.junk {
                         let icon = if entry.is_dir { "📁" } else { "📄" };
                         let resp = ui.selectable_label(
@@ -1556,8 +1557,7 @@ impl BytewhifferApp {
                         if resp.secondary_clicked() {
                             let mut trail = base.clone();
                             trail.extend(entry.trail.iter().cloned());
-                            self.context_target =
-                                Some((trail, entry.path.clone(), entry.is_dir));
+                            self.context_target = Some((trail, entry.path.clone(), entry.is_dir));
                         }
                         resp.context_menu(|ui| self.context_menu_contents(ui));
                     }
@@ -1799,9 +1799,7 @@ impl BytewhifferApp {
             // A few settle frames so the final tree has actually rendered.
             if shot.frames_after_done >= 3 && !shot.requested {
                 shot.requested = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
-                    egui::UserData::default(),
-                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
         }
     }
@@ -1886,7 +1884,11 @@ fn to_insight(node: &Node) -> insights::InsightNode<'_> {
 /// click-to-drill only ever focuses directories.
 fn focus_for(base: &[String], trail: &[String], is_dir: bool) -> Vec<String> {
     let mut f = base.to_vec();
-    let take = if is_dir { trail.len() } else { trail.len().saturating_sub(1) };
+    let take = if is_dir {
+        trail.len()
+    } else {
+        trail.len().saturating_sub(1)
+    };
     f.extend(trail[..take].iter().cloned());
     f
 }
@@ -1984,7 +1986,12 @@ fn size_label_fits(painter: &egui::Painter, block: Rect, size_str: &str) -> bool
 /// chain (`collapse_chain`) can produce a joined name long enough to consume
 /// most of the header on its own, so the tray gate has to account for that
 /// specific label's width rather than assume a short single name.
-fn tray_size_label_fits(painter: &egui::Painter, header_width: f32, label: &str, size_str: &str) -> bool {
+fn tray_size_label_fits(
+    painter: &egui::Painter,
+    header_width: f32,
+    label: &str,
+    size_str: &str,
+) -> bool {
     let font = FontId::proportional(LABEL_FONT_SIZE);
     let label_width = painter
         .layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT)
@@ -2013,12 +2020,13 @@ fn tray_size_label_fits(painter: &egui::Painter, header_width: f32, label: &str,
 /// tessellation steps — so a viewport packed with hundreds of cards stays cheap
 /// enough that hover/pointer tracking doesn't fall behind the cursor. Trays are
 /// already cheap (flat fill + stroke + header) and render the same either way.
+#[allow(clippy::too_many_arguments)]
 fn draw_children(
     painter: &egui::Painter,
     node: &Node,
     rect: Rect,
     depth: usize,
-    trail: &mut Vec<String>,
+    #[allow(clippy::too_many_arguments)] trail: &mut Vec<String>,
     hits: &mut Vec<HitRect>,
     dense: bool,
     gate: NestGate,
@@ -2083,7 +2091,14 @@ fn draw_children(
             // branches, using its name for the frame's identity color.
             let (chain, effective) = collapse_chain(child);
             let label = chain.join(" / ");
-            draw_tray_shell(painter, block, &label, &effective.name, depth, effective.size);
+            draw_tray_shell(
+                painter,
+                block,
+                &label,
+                &effective.name,
+                depth,
+                effective.size,
+            );
 
             let chain_len = chain.len();
             for name in chain {
@@ -2107,13 +2122,23 @@ fn draw_children(
                 Pos2::new(block.left() + inset, block.top() + DIR_LABEL_H + inset),
                 Pos2::new(block.right() - inset, block.bottom() - inset),
             );
-            draw_children(painter, effective, inner, depth + 1, trail, hits, dense, gate);
+            draw_children(
+                painter,
+                effective,
+                inner,
+                depth + 1,
+                trail,
+                hits,
+                dense,
+                gate,
+            );
 
             for _ in 0..chain_len {
                 trail.pop();
             }
         } else {
-            let base = theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
+            let base =
+                theme::depth_shift(theme::base_block_color(&child.name, child.is_dir), depth);
             if card_eligible && !dense {
                 paint_card(painter, block, base);
             } else if card_eligible {
@@ -2336,7 +2361,12 @@ fn gradient_mesh(rect: Rect, radius: f32, top: egui::Color32, bottom: egui::Colo
 /// depth-shifted) fill colour. The shadow is a parameter so treemap cards and
 /// chrome can each pass a shadow scaled to their own element size while sharing
 /// the identical gradient/radius/outline treatment.
-fn paint_elevated(painter: &egui::Painter, rect: Rect, base: egui::Color32, shadow: egui::epaint::Shadow) {
+fn paint_elevated(
+    painter: &egui::Painter,
+    rect: Rect,
+    base: egui::Color32,
+    shadow: egui::epaint::Shadow,
+) {
     painter.add(shadow.as_shape(rect, theme::CARD_CORNER_RADIUS));
     let (top, bottom) = theme::gradient_stops(base);
     painter.add(egui::Shape::mesh(gradient_mesh(
@@ -2389,7 +2419,11 @@ fn chrome_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response
         .painter()
         .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
     let size = galley.size() + pad * 2.0;
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(size, sense);
 
     if ui.is_rect_visible(rect) {
@@ -2398,7 +2432,10 @@ fn chrome_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response
         let (base, text_color) = if !enabled {
             (theme::CHROME_BASE.gamma_multiply(0.5), theme::TEXT_SUBTLE)
         } else if held {
-            (theme::ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.2), theme::BG)
+            (
+                theme::ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.2),
+                theme::BG,
+            )
         } else if hot {
             (theme::ACCENT, theme::BG)
         } else {
@@ -2427,7 +2464,11 @@ fn turbo_toggle(ui: &mut egui::Ui, text: &str, state: TurboState) -> egui::Respo
         .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
     let size = galley.size() + pad * 2.0;
     let clickable = !matches!(state, TurboState::Disabled);
-    let sense = if clickable { Sense::click() } else { Sense::hover() };
+    let sense = if clickable {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(size, sense);
 
     if ui.is_rect_visible(rect) {
@@ -2452,7 +2493,9 @@ fn turbo_toggle(ui: &mut egui::Ui, text: &str, state: TurboState) -> egui::Respo
             }
         };
         paint_surface(ui.painter(), rect, base);
-        let tg = ui.painter().layout_no_wrap(text.to_owned(), font, text_color);
+        let tg = ui
+            .painter()
+            .layout_no_wrap(text.to_owned(), font, text_color);
         let pos = rect.center() - tg.size() / 2.0;
         ui.painter().galley(pos, tg, text_color);
     }
@@ -2478,7 +2521,11 @@ fn chrome_chip(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
         } else {
             theme::CHROME_BASE
         };
-        let text_color = if accent { theme::BG } else { theme::TEXT_SUBTLE };
+        let text_color = if accent {
+            theme::BG
+        } else {
+            theme::TEXT_SUBTLE
+        };
         paint_surface(ui.painter(), rect, base);
         let tg = ui
             .painter()
@@ -2510,7 +2557,10 @@ pub fn run_perf_bench() {
     // Adversarial worst case for the elevation cost: hundreds of similarly
     // sized blocks all above the card threshold, so almost nothing falls back
     // to flat and the shadow/gradient cost is paid on every block.
-    bench_scene("all-cards (400 equal mid-size files)", synth_all_cards_tree());
+    bench_scene(
+        "all-cards (400 equal mid-size files)",
+        synth_all_cards_tree(),
+    );
 }
 
 /// Lays out one scene, then tessellates the flat baseline and the elevation
@@ -2693,7 +2743,11 @@ fn build_elevated_shapes(blocks: &[BenchBlock], clip: Rect) -> Vec<egui::epaint:
         } else if b.is_dir && b.nestable {
             let border = theme::dir_frame_border_color("dir", b.depth);
             let fill = theme::dir_frame_fill_color(border);
-            push(egui::Shape::rect_filled(b.rect, theme::TRAY_CORNER_RADIUS, fill));
+            push(egui::Shape::rect_filled(
+                b.rect,
+                theme::TRAY_CORNER_RADIUS,
+                fill,
+            ));
             push(egui::Shape::rect_stroke(
                 b.rect,
                 theme::TRAY_CORNER_RADIUS,
@@ -2710,7 +2764,11 @@ fn build_elevated_shapes(blocks: &[BenchBlock], clip: Rect) -> Vec<egui::epaint:
                 theme::tray_header_color("dir", b.depth),
             ));
         } else {
-            push(theme::card_shadow().as_shape(b.rect, theme::CARD_CORNER_RADIUS).into());
+            push(
+                theme::card_shadow()
+                    .as_shape(b.rect, theme::CARD_CORNER_RADIUS)
+                    .into(),
+            );
             let (top, bottom) = theme::gradient_stops(base);
             push(egui::Shape::mesh(gradient_mesh(
                 b.rect,
@@ -2764,15 +2822,27 @@ fn synth_dense_tree() -> Entry {
     let installers = dir(
         "Installers",
         (0..14)
-            .map(|i| file(format!("setup{i}.exe"), 200_000_000 + (i as u64) * 90_000_000))
+            .map(|i| {
+                file(
+                    format!("setup{i}.exe"),
+                    200_000_000 + (i as u64) * 90_000_000,
+                )
+            })
             .collect(),
     );
     // A dense ~30-file mosaic of similar mid-size files.
     let downloads = dir(
         "Downloads",
         (0..30)
-            .map(|i| file(format!("clip{i}.mp4"), 6_000_000 + (i as u64 % 5) * 1_000_000))
-            .chain((0..8).map(|i| file(format!("iso{i}.iso"), 700_000_000 + (i as u64) * 30_000_000)))
+            .map(|i| {
+                file(
+                    format!("clip{i}.mp4"),
+                    6_000_000 + (i as u64 % 5) * 1_000_000,
+                )
+            })
+            .chain(
+                (0..8).map(|i| file(format!("iso{i}.iso"), 700_000_000 + (i as u64) * 30_000_000)),
+            )
             .collect(),
     );
     // Nested app dirs (depth) with mixed small files.
@@ -2803,7 +2873,12 @@ fn synth_dense_tree() -> Entry {
     );
 
     let mut loose: Vec<Entry> = (0..8)
-        .map(|i| file(format!("archive{i}.zip"), 1_200_000_000 + (i as u64) * 200_000_000))
+        .map(|i| {
+            file(
+                format!("archive{i}.zip"),
+                1_200_000_000 + (i as u64) * 200_000_000,
+            )
+        })
         .collect();
     loose.extend([
         dir("Windows", vec![system32]),
@@ -2852,7 +2927,10 @@ mod abstraction_tests {
     #[test]
     fn abstract_end_drops_depth_to_the_floor_and_scales_size_up() {
         let gate = resolve_nest_gate(1.0);
-        assert_eq!(gate.max_depth, 1, "full abstract must cap depth at its floor of 1");
+        assert_eq!(
+            gate.max_depth, 1,
+            "full abstract must cap depth at its floor of 1"
+        );
         assert_eq!(gate.min_side, MIN_NEST_SIDE * (1.0 + ABSTRACTION_SIDE_GAIN));
         assert_eq!(
             gate.min_area,
@@ -3036,7 +3114,10 @@ mod scan_responsiveness_tests {
         let mut frames = 0usize;
         loop {
             frames += 1;
-            assert!(frames < 10_000, "assembly should finish well before this many frames");
+            assert!(
+                frames < 10_000,
+                "assembly should finish well before this many frames"
+            );
             if assembly.step(Duration::from_nanos(1)) {
                 break;
             }
@@ -3087,7 +3168,11 @@ mod scan_responsiveness_tests {
                 break;
             }
         }
-        assert_eq!(assembly.progress(), 1.0, "a finished assembly reads as fully complete");
+        assert_eq!(
+            assembly.progress(),
+            1.0,
+            "a finished assembly reads as fully complete"
+        );
     }
 
     #[test]
