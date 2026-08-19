@@ -22,4 +22,4 @@
 ## 4. Verification
 
 - [x] 4.1 Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and `cargo test --release`.
-- [ ] 4.2 Manually exercise rapid Scan/Rescan/target changes on Windows and record that no stale tree replaces the newest scan and the UI remains responsive.
+- [x] 4.2 Manually exercise rapid Scan/Rescan/target changes on Windows and record that no stale tree replaces the newest scan and the UI remains responsive.
