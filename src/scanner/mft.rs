@@ -495,10 +495,7 @@ pub(crate) fn data_runs_of(buf: &[u8]) -> Vec<DataRun> {
     let Some(mut off) = le_u16(buf, rec::FIRST_ATTR_OFFSET).map(|v| v as usize) else {
         return Vec::new();
     };
-    loop {
-        let Some(attr_type) = le_u32(buf, off + attr::TYPE) else {
-            break;
-        };
+    while let Some(attr_type) = le_u32(buf, off + attr::TYPE) {
         if attr_type == ATTR_END {
             break;
         }

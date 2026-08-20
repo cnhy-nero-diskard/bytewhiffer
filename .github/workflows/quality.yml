@@ -1,0 +1,122 @@
+name: Quality Gate
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit SHA to validate.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: Format
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.97.0" # keep in sync with rust-toolchain.toml
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.97.0" # keep in sync with rust-toolchain.toml
+          components: clippy
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo clippy --all-targets --target x86_64-pc-windows-msvc --locked -- -D warnings
+
+  test-debug:
+    name: Debug Tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.97.0" # keep in sync with rust-toolchain.toml
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo test --target x86_64-pc-windows-msvc --locked
+
+  test-release:
+    name: Release Tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.97.0" # keep in sync with rust-toolchain.toml
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo test --release --target x86_64-pc-windows-msvc --locked
+
+  build-release:
+    name: Release Build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.97.0" # keep in sync with rust-toolchain.toml
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo build --release --target x86_64-pc-windows-msvc --locked
+
+  dependency-policy:
+    name: Dependency Policy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.97.0" # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo deny --locked check
+
+  quality-gate:
+    name: Quality Gate
+    if: ${{ always() }}
+    needs: [format, clippy, test-debug, test-release, build-release, dependency-policy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail closed when any required check failed or was skipped
+        shell: bash
+        run: |
+          results=(
+            "${{ needs.format.result }}"
+            "${{ needs.clippy.result }}"
+            "${{ needs.test-debug.result }}"
+            "${{ needs.test-release.result }}"
+            "${{ needs.build-release.result }}"
+            "${{ needs.dependency-policy.result }}"
+          )
+          for result in "${results[@]}"; do
+            if [ "$result" != "success" ]; then
+              echo "Required quality check finished as '$result'." >&2
+              exit 1
+            fi
+          done

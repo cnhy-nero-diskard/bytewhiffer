@@ -66,7 +66,7 @@ echo "Bumping version: $current_version -> $new_version"
 sed -i -E "s/^version\s*=\s*\"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$new_version\"/" "$cargo_toml"
 
 if [ -f "$cargo_lock" ]; then
-    perl -0pi -e "s/(name = \"bytewhiffer\"\nversion = \")\d+\.\d+\.\d+(\")/\${1}$new_version\${2}/" "$cargo_lock"
+    perl -0pi -e "s/(name = \"bytewhiffer\"\r?\nversion = \")\d+\.\d+\.\d+(\")/\${1}$new_version\${2}/" "$cargo_lock"
 fi
 
 git -C "$repo_root" add Cargo.toml Cargo.lock

@@ -2071,7 +2071,7 @@ fn draw_children(
     node: &Node,
     rect: Rect,
     depth: usize,
-    trail: &mut Vec<String>,
+    #[allow(clippy::too_many_arguments)] trail: &mut Vec<String>,
     hits: &mut Vec<HitRect>,
     dense: bool,
     gate: NestGate,
