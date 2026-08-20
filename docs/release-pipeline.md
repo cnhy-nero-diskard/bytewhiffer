@@ -17,18 +17,23 @@ Run the same commands on a Windows machine with the MSVC Build Tools:
 ```powershell
 $target = 'x86_64-pc-windows-msvc'
 cargo fmt --all -- --check
-cargo clippy --all-targets --target $target -- -D warnings
-cargo test --target $target
-cargo test --release --target $target
-cargo build --release --target $target
+cargo clippy --all-targets --target $target --locked -- -D warnings
+cargo test --target $target --locked
+cargo test --release --target $target --locked
+cargo build --release --target $target --locked
 cargo install cargo-deny --version 0.20.2 --locked
-cargo deny check
+cargo deny --locked check
 ```
+
+Every command that resolves dependencies passes `--locked` so CI fails on a
+stale or inconsistent `Cargo.lock` instead of silently re-resolving it.
 
 ## Dependency-policy exceptions
 
-`deny.toml` enforces advisories, licenses, banned/duplicate dependencies, and
-sources. Do not add broad ignores or blanket allowlists to bypass a finding. A
+`deny.toml` enforces advisories, licenses, banned dependencies, and sources;
+duplicate dependency versions are reported as warnings rather than blocked,
+since the GUI stack legitimately carries incompatible major versions. Do not
+add broad ignores or blanket allowlists to bypass a finding. A
 temporary exception must identify the exact crate and version, include a
 rationale, and state the date on which it must be reviewed or removed.
 

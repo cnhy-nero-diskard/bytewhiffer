@@ -38,7 +38,7 @@ jobs:
           components: clippy
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - run: cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - run: cargo clippy --all-targets --target x86_64-pc-windows-msvc --locked -- -D warnings
 
   test-debug:
     name: Debug Tests
@@ -52,7 +52,7 @@ jobs:
           toolchain: "1.97.0" # keep in sync with rust-toolchain.toml
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - run: cargo test --target x86_64-pc-windows-msvc
+      - run: cargo test --target x86_64-pc-windows-msvc --locked
 
   test-release:
     name: Release Tests
@@ -66,7 +66,7 @@ jobs:
           toolchain: "1.97.0" # keep in sync with rust-toolchain.toml
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - run: cargo test --release --target x86_64-pc-windows-msvc
+      - run: cargo test --release --target x86_64-pc-windows-msvc --locked
 
   build-release:
     name: Release Build
@@ -80,7 +80,7 @@ jobs:
           toolchain: "1.97.0" # keep in sync with rust-toolchain.toml
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - run: cargo build --release --target x86_64-pc-windows-msvc
+      - run: cargo build --release --target x86_64-pc-windows-msvc --locked
 
   dependency-policy:
     name: Dependency Policy
@@ -95,7 +95,7 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Install pinned cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
-      - run: cargo deny check
+      - run: cargo deny --locked check
 
   quality-gate:
     name: Quality Gate
