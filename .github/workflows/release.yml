@@ -45,6 +45,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.97.0" # keep in sync with rust-toolchain.toml
+          targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Build the validated MSVC release executable
         run: cargo build --release --target x86_64-pc-windows-msvc
