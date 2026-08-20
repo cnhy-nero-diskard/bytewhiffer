@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 
 use rayon::prelude::*;
 
-use super::{Availability, Entry, ScanContext, ScanEngine, ScanError, ScanEvent};
+use super::{Availability, Entry, ScanContext, ScanEngine, ScanError, ScanEvent, ScanOutcome};
 
 /// The parallel directory-walk engine.
 pub struct WalkerEngine;
@@ -25,13 +25,20 @@ impl ScanEngine for WalkerEngine {
         Availability::Available
     }
 
-    fn scan(&self, target: &Path, ctx: &ScanContext) -> Result<Entry, ScanError> {
+    fn scan(&self, target: &Path, ctx: &ScanContext) -> ScanOutcome {
+        // Check before even probing the root so pre-cancelled generations do
+        // not perform filesystem work or publish an empty success tree.
+        if ctx.is_cancelled() {
+            ctx.progress.mark_complete();
+            return ScanOutcome::Cancelled;
+        }
+
         // The root must at least be readable as a directory; anything less
         // is a total failure the caller should see, unlike unreadable
         // entries deeper in the tree, which are skipped.
         if let Err(err) = std::fs::read_dir(target) {
             ctx.progress.mark_complete();
-            return Err(ScanError::RootUnreadable(err));
+            return ScanOutcome::Failed(ScanError::RootUnreadable(err));
         }
 
         let name = target
@@ -39,71 +46,86 @@ impl ScanEngine for WalkerEngine {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| target.to_string_lossy().into_owned());
 
-        let mut entry = scan_dir(target, name, ctx);
+        let Some(mut entry) = scan_dir(target, name, ctx) else {
+            ctx.progress.mark_complete();
+            return ScanOutcome::Cancelled;
+        };
+        if ctx.is_cancelled() {
+            ctx.progress.mark_complete();
+            return ScanOutcome::Cancelled;
+        }
         entry.sort_children_recursive();
+        if ctx.is_cancelled() {
+            ctx.progress.mark_complete();
+            return ScanOutcome::Cancelled;
+        }
         ctx.progress.mark_complete();
-        Ok(entry)
+        ScanOutcome::Success(entry)
     }
 }
 
-fn scan_dir(path: &Path, name: String, ctx: &ScanContext) -> Entry {
+fn scan_dir(path: &Path, name: String, ctx: &ScanContext) -> Option<Entry> {
+    if ctx.is_cancelled() {
+        return None;
+    }
+
     let mut children = Vec::new();
     let mut subdirs: Vec<(PathBuf, String)> = Vec::new();
     let mut total: u64 = 0;
 
-    if !ctx.is_cancelled() {
-        if let Ok(read_dir) = std::fs::read_dir(path) {
-            for entry_result in read_dir {
-                if ctx.is_cancelled() {
-                    break;
-                }
+    if let Ok(read_dir) = std::fs::read_dir(path) {
+        for entry_result in read_dir {
+            if ctx.is_cancelled() {
+                return None;
+            }
 
-                let Ok(dir_entry) = entry_result else {
-                    continue;
-                };
+            let Ok(dir_entry) = entry_result else {
+                continue;
+            };
 
-                // `file_type()` reflects the entry itself and does not
-                // follow symlinks/junctions, unlike `metadata()` on some
-                // platforms. Skipping symlinks avoids double-counting and
-                // infinite loops on cyclic junctions.
-                let Ok(file_type) = dir_entry.file_type() else {
-                    continue;
-                };
-                if file_type.is_symlink() {
-                    continue;
-                }
+            // `file_type()` reflects the entry itself and does not
+            // follow symlinks/junctions, unlike `metadata()` on some
+            // platforms. Skipping symlinks avoids double-counting and
+            // infinite loops on cyclic junctions.
+            let Ok(file_type) = dir_entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
 
-                let child_name = dir_entry.file_name().to_string_lossy().into_owned();
-                let child_path = dir_entry.path();
+            let child_name = dir_entry.file_name().to_string_lossy().into_owned();
+            let child_path = dir_entry.path();
 
-                if file_type.is_dir() {
-                    ctx.progress.dirs_scanned.fetch_add(1, Ordering::Relaxed);
-                    ctx.emit(ScanEvent::Discovered {
-                        path: child_path.clone(),
-                        size: 0,
-                        is_dir: true,
-                    });
-                    subdirs.push((child_path, child_name));
-                } else {
-                    let size = dir_entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    total += size;
-                    ctx.progress.files_scanned.fetch_add(1, Ordering::Relaxed);
-                    ctx.progress
-                        .bytes_scanned
-                        .fetch_add(size, Ordering::Relaxed);
-                    ctx.emit(ScanEvent::Discovered {
-                        path: child_path.clone(),
-                        size,
-                        is_dir: false,
-                    });
-                    children.push(Entry {
-                        name: child_name,
-                        path: child_path,
-                        size,
-                        is_dir: false,
-                        children: Vec::new(),
-                    });
-                }
+            if file_type.is_dir() {
+                ctx.progress.dirs_scanned.fetch_add(1, Ordering::Relaxed);
+                ctx.emit(ScanEvent::Discovered {
+                    scan_id: 0,
+                    path: child_path.clone(),
+                    size: 0,
+                    is_dir: true,
+                });
+                subdirs.push((child_path, child_name));
+            } else {
+                let size = dir_entry.metadata().map(|m| m.len()).unwrap_or(0);
+                total += size;
+                ctx.progress.files_scanned.fetch_add(1, Ordering::Relaxed);
+                ctx.progress
+                    .bytes_scanned
+                    .fetch_add(size, Ordering::Relaxed);
+                ctx.emit(ScanEvent::Discovered {
+                    scan_id: 0,
+                    path: child_path.clone(),
+                    size,
+                    is_dir: false,
+                });
+                children.push(Entry {
+                    name: child_name,
+                    path: child_path,
+                    size,
+                    is_dir: false,
+                    children: Vec::new(),
+                });
             }
         }
     }
@@ -113,26 +135,29 @@ fn scan_dir(path: &Path, name: String, ctx: &ScanContext) -> Entry {
     // the directory subtotals.
     let dir_children: Vec<Entry> = subdirs
         .into_par_iter()
-        .map(|(child_path, child_name)| scan_dir(&child_path, child_name, ctx))
+        .filter_map(|(child_path, child_name)| scan_dir(&child_path, child_name, ctx))
         .collect();
+    if ctx.is_cancelled() {
+        return None;
+    }
     for child in dir_children {
         total += child.size;
         children.push(child);
     }
 
-    Entry {
+    Some(Entry {
         name,
         path: path.to_path_buf(),
         size: total,
         is_dir: true,
         children,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::scanner::{ScanOutcome, LIVE_EVENT_CAPACITY};
     use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -186,11 +211,18 @@ mod tests {
         dir
     }
 
+    fn success(outcome: ScanOutcome) -> Entry {
+        match outcome {
+            ScanOutcome::Success(tree) => tree,
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
     #[test]
     fn computes_recursive_sizes() {
         let dir = make_fixture();
         let ctx = ScanContext::new();
-        let tree = WalkerEngine.scan(dir.path(), &ctx).unwrap();
+        let tree = success(WalkerEngine.scan(dir.path(), &ctx));
 
         assert!(tree.is_dir);
         assert_eq!(tree.size, 150);
@@ -209,7 +241,7 @@ mod tests {
     fn children_sorted_largest_first() {
         let dir = make_fixture();
         let ctx = ScanContext::new();
-        let tree = WalkerEngine.scan(dir.path(), &ctx).unwrap();
+        let tree = success(WalkerEngine.scan(dir.path(), &ctx));
 
         // a.txt (100 bytes) should sort before sub/ (50 bytes).
         assert_eq!(tree.children[0].name, "a.txt");
@@ -220,7 +252,7 @@ mod tests {
     fn progress_counters_track_files_bytes_and_dirs() {
         let dir = make_fixture();
         let ctx = ScanContext::new();
-        let _tree = WalkerEngine.scan(dir.path(), &ctx).unwrap();
+        let _tree = success(WalkerEngine.scan(dir.path(), &ctx));
 
         assert_eq!(ctx.progress.files_scanned.load(Ordering::Relaxed), 2);
         assert_eq!(ctx.progress.bytes_scanned.load(Ordering::Relaxed), 150);
@@ -233,7 +265,7 @@ mod tests {
         let dir = make_fixture();
         let ctx = ScanContext::new();
         assert!(!ctx.progress.is_complete());
-        let _tree = WalkerEngine.scan(dir.path(), &ctx).unwrap();
+        let _tree = success(WalkerEngine.scan(dir.path(), &ctx));
         assert!(ctx.progress.is_complete());
     }
 
@@ -244,12 +276,14 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(true)), // already cancelled
             ..ScanContext::new()
         };
-        let tree = WalkerEngine.scan(dir.path(), &ctx).unwrap();
+        assert!(matches!(
+            WalkerEngine.scan(dir.path(), &ctx),
+            ScanOutcome::Cancelled
+        ));
 
         // With cancel already set, scan_dir should not even read the top
         // directory's entries.
-        assert_eq!(tree.size, 0);
-        assert_eq!(tree.child_count(), 0);
+        assert!(ctx.progress.is_complete());
     }
 
     #[test]
@@ -267,7 +301,10 @@ mod tests {
         let missing = dir.path().join("does_not_exist");
         let ctx = ScanContext::new();
         let result = WalkerEngine.scan(&missing, &ctx);
-        assert!(matches!(result, Err(ScanError::RootUnreadable(_))));
+        assert!(matches!(
+            result,
+            ScanOutcome::Failed(ScanError::RootUnreadable(_))
+        ));
         // Even a failed scan must leave progress in a final state.
         assert!(ctx.progress.is_complete());
     }
@@ -289,7 +326,7 @@ mod tests {
         // Restore permissions so TempDir::drop can clean up.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let tree = result.expect("partial success, not a ScanError");
+        let tree = success(result);
         // The locked dir appears (it was listable) but its contents don't.
         let locked_entry = tree
             .children
@@ -305,15 +342,21 @@ mod tests {
     #[test]
     fn events_stream_every_discovered_entry() {
         let dir = make_fixture();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(32);
         let ctx = ScanContext::new().with_events(tx);
-        let _tree = WalkerEngine.scan(dir.path(), &ctx).unwrap();
+        let _tree = success(WalkerEngine.scan(dir.path(), &ctx));
 
         let events: Vec<ScanEvent> = rx.try_iter().collect();
         let mut files = 0;
         let mut dirs = 0;
         for event in &events {
-            let ScanEvent::Discovered { size, is_dir, .. } = event;
+            let ScanEvent::Discovered {
+                size,
+                is_dir,
+                scan_id,
+                ..
+            } = event;
+            assert_eq!(*scan_id, 0);
             if *is_dir {
                 dirs += 1;
             } else {
@@ -323,5 +366,26 @@ mod tests {
         }
         assert_eq!(files, 2); // a.txt + b.txt
         assert_eq!(dirs, 2); // sub + empty_dir
+    }
+
+    #[test]
+    fn saturated_preview_drops_events_without_losing_authoritative_tree() {
+        let dir = TempDir::new();
+        let file_count = LIVE_EVENT_CAPACITY + 128;
+        for i in 0..file_count {
+            fs::write(dir.path().join(format!("file_{i}.bin")), [0u8; 1]).unwrap();
+        }
+
+        let (tx, rx) = super::super::live_event_channel();
+        let ctx = ScanContext::new().with_events(tx);
+        let started = std::time::Instant::now();
+        let tree = success(WalkerEngine.scan(dir.path(), &ctx));
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a full preview queue must not block scanner traversal"
+        );
+        assert_eq!(tree.child_count(), file_count);
+        assert_eq!(rx.try_iter().count(), LIVE_EVENT_CAPACITY);
     }
 }

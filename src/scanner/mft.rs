@@ -490,6 +490,7 @@ pub(crate) fn parse_data_runs(b: &[u8]) -> Vec<DataRun> {
 /// Finds the unnamed non-resident `$DATA` attribute in a (fixed-up) FILE record
 /// and returns its decoded data runs. Used to locate the `$MFT`'s own fragments
 /// from record 0. Returns an empty vec if `$DATA` is resident or absent.
+#[allow(clippy::while_let_loop)]
 pub(crate) fn data_runs_of(buf: &[u8]) -> Vec<DataRun> {
     let Some(mut off) = le_u16(buf, rec::FIRST_ATTR_OFFSET).map(|v| v as usize) else {
         return Vec::new();
@@ -686,7 +687,7 @@ impl super::ScanEngine for MftEngine {
         resolve_availability(volume_is_ntfs(target), process_is_elevated())
     }
 
-    fn scan(&self, target: &Path, ctx: &super::ScanContext) -> Result<Entry, super::ScanError> {
+    fn scan(&self, target: &Path, ctx: &super::ScanContext) -> super::ScanOutcome {
         platform::scan(target, ctx)
     }
 }
@@ -769,7 +770,7 @@ mod platform {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
-    use crate::scanner::{Entry, ScanContext, ScanError};
+    use crate::scanner::{Entry, ScanContext, ScanError, ScanOutcome};
 
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -970,18 +971,20 @@ mod platform {
         node
     }
 
-    pub fn scan(target: &Path, ctx: &ScanContext) -> Result<Entry, ScanError> {
+    pub fn scan(target: &Path, ctx: &ScanContext) -> ScanOutcome {
         // Guard the capability contract: only run on elevated + NTFS.
         match resolve_availability(volume_is_ntfs(target), process_is_elevated()) {
             Availability::Available => {}
             other => {
                 ctx.progress.mark_complete();
-                return Err(ScanError::Unavailable(other));
+                return ScanOutcome::Failed(ScanError::Unavailable(other));
             }
         }
         let Some(drive) = drive_of(target) else {
             ctx.progress.mark_complete();
-            return Err(ScanError::Unavailable(Availability::UnsupportedFilesystem));
+            return ScanOutcome::Failed(ScanError::Unavailable(
+                Availability::UnsupportedFilesystem,
+            ));
         };
 
         let read_result = (|| {
@@ -992,13 +995,13 @@ mod platform {
             Ok(v) => v,
             Err(err) => {
                 ctx.progress.mark_complete();
-                return Err(ScanError::RootUnreadable(err));
+                return ScanOutcome::Failed(ScanError::RootUnreadable(err));
             }
         };
 
-        if ctx.cancel.load(Ordering::Relaxed) {
+        if ctx.is_cancelled() {
             ctx.progress.mark_complete();
-            return Ok(empty_root(target));
+            return ScanOutcome::Cancelled;
         }
 
         // Parse every fixed-size record in parallel. Records are independent
@@ -1008,7 +1011,7 @@ mod platform {
         let records: Vec<ParsedRecord> = (0..count)
             .into_par_iter()
             .filter_map(|i| {
-                if ctx.cancel.load(Ordering::Relaxed) {
+                if ctx.is_cancelled() {
                     return None;
                 }
                 let start = i * record_size;
@@ -1020,9 +1023,9 @@ mod platform {
             })
             .collect();
 
-        if ctx.cancel.load(Ordering::Relaxed) {
+        if ctx.is_cancelled() {
             ctx.progress.mark_complete();
-            return Ok(empty_root(target));
+            return ScanOutcome::Cancelled;
         }
 
         // Reconstruct the whole volume from the root directory, then carve out
@@ -1038,24 +1041,12 @@ mod platform {
         subtree.sort_children_recursive();
 
         tally(&subtree, ctx);
-        ctx.progress.mark_complete();
-        Ok(subtree)
-    }
-
-    /// An empty directory node for `target`, used for a cancelled scan's
-    /// partial result.
-    fn empty_root(target: &Path) -> Entry {
-        let name = target
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| target.to_string_lossy().into_owned());
-        Entry {
-            name,
-            path: target.to_path_buf(),
-            size: 0,
-            is_dir: true,
-            children: Vec::new(),
+        if ctx.is_cancelled() {
+            ctx.progress.mark_complete();
+            return ScanOutcome::Cancelled;
         }
+        ctx.progress.mark_complete();
+        ScanOutcome::Success(subtree)
     }
 
     /// Populates the progress counters from the finished tree in one walk. This
@@ -1082,7 +1073,7 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::*;
-    use crate::scanner::{Entry, ScanContext, ScanError};
+    use crate::scanner::{Entry, ScanContext, ScanError, ScanOutcome};
     use std::path::Path;
 
     pub fn process_is_elevated() -> bool {
@@ -1097,9 +1088,9 @@ mod platform {
         Ok(false)
     }
 
-    pub fn scan(_target: &Path, ctx: &ScanContext) -> Result<Entry, ScanError> {
+    pub fn scan(_target: &Path, ctx: &ScanContext) -> ScanOutcome {
         ctx.progress.mark_complete();
-        Err(ScanError::Unavailable(Availability::UnsupportedFilesystem))
+        ScanOutcome::Failed(ScanError::Unavailable(Availability::UnsupportedFilesystem))
     }
 }
 

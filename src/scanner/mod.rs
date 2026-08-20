@@ -5,11 +5,25 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 
 pub mod mft;
 pub mod walker;
+
+/// Process-local identity for one scan generation.
+pub type ScanId = u64;
+
+/// Maximum number of provisional discovery events retained for the UI.
+///
+/// Discovery is deliberately best-effort: scanners must never wait for the UI
+/// to make room. The authoritative `Entry` tree is returned separately.
+pub const LIVE_EVENT_CAPACITY: usize = 1024;
+
+/// Creates the bounded channel used for provisional live discovery.
+pub fn live_event_channel() -> (SyncSender<ScanEvent>, Receiver<ScanEvent>) {
+    std::sync::mpsc::sync_channel(LIVE_EVENT_CAPACITY)
+}
 
 /// A single file or directory discovered during a scan.
 ///
@@ -82,6 +96,23 @@ pub enum ScanError {
     RootUnreadable(std::io::Error),
 }
 
+/// The complete outcome of one scan generation.
+///
+/// Cancellation is normal control flow and is intentionally not represented
+/// as an empty or partial `Entry`. A caller can therefore avoid installing a
+/// cancelled tree or showing a failure dialog.
+#[derive(Debug)]
+pub enum ScanOutcome {
+    /// The engine produced the authoritative tree.
+    Success(Entry),
+    /// Cooperative cancellation stopped this generation.
+    Cancelled,
+    /// The engine could not produce a result.
+    Failed(ScanError),
+    /// The worker contained a panic raised by the engine.
+    Panicked,
+}
+
 /// Shared, lock-free progress state a caller can poll from another thread to
 /// show "N files / X GB scanned so far" while a scan is in flight. Counters
 /// only ever increase during a scan; `complete` flips once, when the engine
@@ -99,6 +130,7 @@ impl ScanProgress {
         self.complete.store(true, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn is_complete(&self) -> bool {
         self.complete.load(Ordering::Relaxed)
     }
@@ -109,10 +141,26 @@ impl ScanProgress {
 #[derive(Debug, Clone)]
 pub enum ScanEvent {
     Discovered {
+        scan_id: ScanId,
         path: PathBuf,
         size: u64,
         is_dir: bool,
     },
+}
+
+impl ScanEvent {
+    fn with_scan_id(self, scan_id: ScanId) -> Self {
+        match self {
+            Self::Discovered {
+                path, size, is_dir, ..
+            } => Self::Discovered {
+                scan_id,
+                path,
+                size,
+                is_dir,
+            },
+        }
+    }
 }
 
 /// Everything an engine needs to communicate with the rest of the app while
@@ -127,30 +175,53 @@ pub enum ScanEvent {
 /// it, and must not depend on it; the authoritative result is always the
 /// final `Entry` tree returned by [`ScanEngine::scan`].
 pub struct ScanContext {
+    /// Generation identity copied onto every emitted event.
+    pub scan_id: ScanId,
     pub cancel: Arc<AtomicBool>,
     pub progress: Arc<ScanProgress>,
-    pub events: Option<Sender<ScanEvent>>,
+    pub events: Option<SyncSender<ScanEvent>>,
 }
 
 impl ScanContext {
     pub fn new() -> Self {
         Self {
+            scan_id: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(ScanProgress::default()),
             events: None,
         }
     }
 
-    pub fn with_events(mut self, sender: Sender<ScanEvent>) -> Self {
+    pub fn with_scan_id(mut self, scan_id: ScanId) -> Self {
+        self.scan_id = scan_id;
+        self
+    }
+
+    pub fn with_events(mut self, sender: SyncSender<ScanEvent>) -> Self {
         self.events = Some(sender);
         self
+    }
+
+    /// Returns the UI-side view of this context without retaining an event
+    /// sender. Dropping the event receiver can therefore disconnect the
+    /// worker's live preview channel when a generation is superseded.
+    pub fn ui_handle(&self) -> Self {
+        Self {
+            scan_id: self.scan_id,
+            cancel: self.cancel.clone(),
+            progress: self.progress.clone(),
+            events: None,
+        }
     }
 
     /// Sends a discovery event if a sink is attached, ignoring a
     /// disconnected receiver (the UI hanging up is not the scan's problem).
     pub(crate) fn emit(&self, event: ScanEvent) {
         if let Some(sender) = &self.events {
-            let _ = sender.send(event);
+            // Live discovery is provisional. A full or disconnected queue is
+            // intentionally ignored so scanner traversal never waits for UI
+            // capacity and never treats a closed preview as scan failure.
+            let _ = sender.try_send(event.with_scan_id(self.scan_id));
         }
     }
 
@@ -177,11 +248,10 @@ pub trait ScanEngine: Send + Sync {
     /// anything other than [`Availability::Available`].
     fn is_available(&self, target: &Path) -> Availability;
 
-    /// Scans `target`, returning its completed [`Entry`] tree with children
-    /// sorted largest-first. Individual unreadable entries are skipped and
-    /// simply absent from the tree; an `Err` means the engine could not
-    /// produce a result at all. Implementations must honor `ctx.cancel`
-    /// (returning the partial tree built so far), keep `ctx.progress`
-    /// monotonically increasing, and call `mark_complete` before returning.
-    fn scan(&self, target: &Path, ctx: &ScanContext) -> Result<Entry, ScanError>;
+    /// Scans `target`, returning a typed success, cancellation, or failure
+    /// outcome. Individual unreadable entries are skipped and simply absent
+    /// from a successful tree. Implementations must honor `ctx.cancel`, keep
+    /// `ctx.progress` monotonically increasing, and call `mark_complete`
+    /// before returning.
+    fn scan(&self, target: &Path, ctx: &ScanContext) -> ScanOutcome;
 }
