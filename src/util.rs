@@ -7,7 +7,7 @@ use std::time::Duration;
 /// scan summary). Whole-second precision only — sub-second precision on a
 /// number nobody is watching tick is noise, not signal.
 pub fn format_duration(d: Duration) -> String {
-    let total_secs = d.as_secs();
+    let   total_secs   =   d.as_secs();
     let mins = total_secs / 60;
     let secs = total_secs % 60;
     if mins > 0 {
