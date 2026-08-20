@@ -28,5 +28,11 @@
 
 - [x] 5.1 Validate workflow YAML and run the full local equivalents for format, clippy, debug/release tests, release build, and dependency policy.
 - [ ] 5.2 Exercise PR, acceptable-main, rejected-main, failing-check, and tag dry-run paths and confirm no required gate is silently skipped.
+  - PR path: verified via PR #10 — all required checks reached terminal success.
+  - Acceptable-main path: verified via the PR #10 merge commit's push-triggered `CI` run — terminal success.
+  - Rejected-main path: verified via an intentionally unverified merge commit pushed directly to `main` (reverted immediately after) — `commit-policy` correctly failed with "Unverified merge commits are not accepted on main.", and the aggregate `CI` job correctly failed overall even though `Quality Gate` passed on its own.
+  - Failing-check path: verified via a disposable draft PR (#11, closed without merging) with a deliberate formatting violation — `Quality / Format` failed, `Quality Gate` and `CI` both correctly failed rather than skipping/passing.
+  - Tag dry-run path: not yet exercised — deferred alongside 5.3, since this repo's `release.yml` has no notion of a non-destructive tag dry run; any tag push both validates and (on success) publishes a real release.
 - [ ] 5.3 Complete a non-production release rehearsal or next real release and verify the executable/checksum pair and immutable action references before marking the change done.
+  - Deliberately deferred to the next real release per reviewer discussion on PR #10 — tag pushes always trigger the real, publishing release workflow in this design, so there is no lower-risk "rehearsal" short of an actual release.
 
