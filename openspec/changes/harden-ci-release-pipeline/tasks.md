@@ -13,7 +13,7 @@
 ## 3. CI Semantics
 
 - [x] 3.1 Replace the `proceed=false` skip path with explicit non-zero commit-policy failure or remove the policy gate if repository rules make it redundant.
-- [ ] 3.2 Invoke the reusable quality gate for pull requests and every main-branch commit and verify required checks reach terminal success/failure.
+- [x] 3.2 Invoke the reusable quality gate for pull requests and every main-branch commit and verify required checks reach terminal success/failure.
 - [x] 3.3 Remove the unused GNU target installation unless a separate job explicitly builds and validates it.
 
 ## 4. Release Hardening
