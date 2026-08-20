@@ -19,7 +19,7 @@
 ## 4. Release Hardening
 
 - [x] 4.1 Make release validation run/depend on the reusable quality gate for the exact tag commit before artifact creation.
-- [ ] 4.2 Preserve and test the tag-to-`Cargo.toml` version guard and existing release scripts.
+- [x] 4.2 Preserve and test the tag-to-`Cargo.toml` version guard and existing release scripts.
 - [x] 4.3 Compute and upload a SHA-256 checksum alongside the exact executable and verify it before publication.
 - [x] 4.4 Pin every release-critical third-party action to a full commit SHA with an upstream-version comment.
 - [x] 4.5 Document code signing, SBOM, and provenance as explicitly deferred follow-ups rather than implying they are present.
