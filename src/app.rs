@@ -3,17 +3,18 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::insights;
-use crate::scan_controller::{ScanCompletion, ScanController};
+use crate::scan_controller::{PreparedOutcome, ScanCompletion, ScanController};
 use crate::scanner::{
     mft::{self, MftEngine},
     walker::WalkerEngine,
-    Availability, Entry, ScanEngine, ScanError, ScanEvent, ScanId, ScanOutcome,
+    Availability, Entry, ScanEngine, ScanError, ScanEvent, ScanId,
 };
 use crate::theme;
 use crate::treemap;
@@ -76,242 +77,21 @@ const SIZE_LABEL_NAME_RESERVE: f32 = 44.0;
 /// Horizontal gap kept between a tray header's name (or collapsed-chain)
 /// label and its size label, so the two never sit flush against each other.
 const TRAY_LABEL_GAP: f32 = 10.0;
-/// Wall-clock time budget for one frame's scan-data processing — shared by
-/// `drain_scan`'s live-event draining and `PendingAssembly::step`'s
-/// authoritative-tree assembly. Bounds the actual frame-blocking duration
-/// directly (an item-count cap would still stall unpredictably depending on
-/// how expensive a given path happens to be to insert), so a discovery burst
-/// or a huge completed tree spreads its cost across multiple frames instead
-/// of stalling one.
+/// Wall-clock time budget for one frame's live scan-event processing. Bounds
+/// the actual frame-blocking duration directly so a discovery burst spreads
+/// its UI insertion cost across multiple frames instead of stalling one.
 const SCAN_FRAME_BUDGET: Duration = Duration::from_millis(8);
-/// How many items a budgeted loop processes between wall-clock checks —
-/// avoids paying a clock read on literally every single item.
-const SCAN_BUDGET_CHECK_INTERVAL: usize = 256;
 /// Smoothing factor for the scan-rate EMA (`rate = rate*(1-α) + instant*α`),
 /// applied at the same ~1s cadence as `rate_sample`. Chosen by feel against a
 /// large scan target — high enough to track a real trend within a couple
 /// samples, low enough that a single noisy per-second delta doesn't dominate.
 const RATE_EMA_ALPHA: f64 = 0.3;
 
-/// UI-side mirror of the scan tree. Built incrementally from `ScanEvent`s
-/// while a scan runs (so the map fills in live), then swapped wholesale for
-/// the engine's authoritative tree when the scan completes. The name→index
-/// map makes per-event path insertion cheap even for huge directories.
-struct Node {
-    name: String,
-    path: PathBuf,
-    size: u64,
-    is_dir: bool,
-    children: Vec<Node>,
-    child_index: HashMap<String, usize>,
-}
-
-impl Node {
-    fn new(name: String, path: PathBuf, size: u64, is_dir: bool) -> Self {
-        Self {
-            name,
-            path,
-            size,
-            is_dir,
-            children: Vec::new(),
-            child_index: HashMap::new(),
-        }
-    }
-
-    /// Inserts a discovered entry by its path relative to this node,
-    /// creating intermediate directories as needed and accumulating file
-    /// sizes into every ancestor on the way down.
-    fn insert(&mut self, rel: &Path, size: u64, is_dir: bool) {
-        let mut components: Vec<String> = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        if components.is_empty() {
-            return;
-        }
-        let leaf = components.pop().unwrap();
-
-        self.size += size;
-        let mut node = self;
-        let mut path = node.path.clone();
-        for comp in components {
-            path.push(&comp);
-            let idx = match node.child_index.get(&comp) {
-                Some(&i) => i,
-                None => {
-                    let i = node.children.len();
-                    node.children
-                        .push(Node::new(comp.clone(), path.clone(), 0, true));
-                    node.child_index.insert(comp.clone(), i);
-                    i
-                }
-            };
-            node = &mut node.children[idx];
-            node.size += size;
-        }
-
-        path.push(&leaf);
-        match node.child_index.get(&leaf) {
-            Some(&i) => node.children[i].size += size,
-            None => {
-                let i = node.children.len();
-                node.children
-                    .push(Node::new(leaf.clone(), path, size, is_dir));
-                node.child_index.insert(leaf, i);
-            }
-        }
-    }
-
-    /// Converts the engine's final tree into the UI shape.
-    fn from_entry(entry: &Entry) -> Self {
-        let mut node = Node::new(
-            entry.name.clone(),
-            entry.path.clone(),
-            entry.size,
-            entry.is_dir,
-        );
-        for (i, child) in entry.children.iter().enumerate() {
-            node.child_index.insert(child.name.clone(), i);
-            node.children.push(Node::from_entry(child));
-        }
-        node
-    }
-
-    fn find(&self, names: &[String]) -> Option<&Node> {
-        let mut node = self;
-        for name in names {
-            node = &node.children[*node.child_index.get(name)?];
-        }
-        Some(node)
-    }
-
-    /// Total entries in this node's subtree, excluding the node itself — every
-    /// descendant file and directory, at any depth. A stable, cheap density
-    /// proxy for the render-tier decision (see `BytewhifferApp::refresh_density`),
-    /// walked once per (focus, tree_rev) change rather than every frame.
-    fn descendant_count(&self) -> usize {
-        self.children.iter().map(|c| 1 + c.descendant_count()).sum()
-    }
-
-    /// Removes the node at `names`, subtracting its accounted size from every
-    /// ancestor while unwinding. Returns the removed subtree's allocated bytes,
-    /// or `None` if the path does not exist.
-    fn remove(&mut self, names: &[String]) -> Option<u64> {
-        let (name, remainder) = names.split_first()?;
-        let index = *self.child_index.get(name)?;
-
-        if remainder.is_empty() {
-            let removed_size = self.children.get(index)?.size;
-            self.children.remove(index);
-            self.child_index.clear();
-            for (child_index, child) in self.children.iter().enumerate() {
-                self.child_index.insert(child.name.clone(), child_index);
-            }
-            self.size = self.size.saturating_sub(removed_size);
-            Some(removed_size)
-        } else {
-            let removed_size = self.children.get_mut(index)?.remove(remainder)?;
-            self.size = self.size.saturating_sub(removed_size);
-            Some(removed_size)
-        }
-    }
-}
-
-/// An in-progress, resumable conversion of the scan engine's authoritative
-/// `Entry` tree into the UI's `Node` shape, processed a bounded slice at a
-/// time (see `step`) across multiple frames instead of one uninterrupted
-/// recursion — the scan-completion counterpart to `drain_scan`'s own
-/// per-frame pacing. Unlike `Node::from_entry` (a plain recursive one-shot
-/// conversion, still used by contexts with no pacing concerns, e.g. the
-/// `--debug-perf` bench), this grows the destination tree via an explicit
-/// worklist so the traversal can pause between any two items and resume
-/// later from the same state — no call stack to suspend.
-struct PendingAssembly {
-    id: ScanId,
-    /// The tree being built. Starts as just the converted root; every
-    /// worklist item appends one more converted node under some already-
-    /// created parent.
-    root: Node,
-    /// Pending (path to the parent `Node` in `root`, not-yet-converted source
-    /// `Entry`) pairs, in visitation order. A path rather than a direct
-    /// reference to the parent, since the parent's `Vec<Node>` is still
-    /// growing as siblings are processed — indices stay valid across steps,
-    /// unlike a pointer or reference would.
-    worklist: Vec<(Vec<usize>, Entry)>,
-    /// Total items ever queued onto `worklist` (grows as a popped entry's own
-    /// children are queued in `step`), so `progress` can derive an exact
-    /// completion fraction — unlike the open-ended walk phase, assembly's
-    /// total work is knowable as it's discovered.
-    total: usize,
-}
-
-impl PendingAssembly {
-    /// Starts a new resumable assembly: converts just the root entry and
-    /// queues its children for the first `step`.
-    fn start_for(id: ScanId, entry: Entry) -> Self {
-        let root = Node::new(entry.name, entry.path, entry.size, entry.is_dir);
-        let worklist: Vec<(Vec<usize>, Entry)> = entry
-            .children
-            .into_iter()
-            .map(|child| (Vec::new(), child))
-            .collect();
-        let total = worklist.len();
-        Self {
-            id,
-            root,
-            worklist,
-            total,
-        }
-    }
-
-    /// Processes worklist items until either the worklist empties (returns
-    /// `true` — assembly is fully complete, `root` is ready to swap in) or
-    /// `budget` of wall-clock time has elapsed (returns `false` — call again
-    /// next frame to continue from the same state). Checks elapsed time only
-    /// once every `SCAN_BUDGET_CHECK_INTERVAL` items, not per item, to avoid
-    /// paying a clock read on each one.
-    fn step(&mut self, budget: Duration) -> bool {
-        let started = Instant::now();
-        let mut since_check = 0usize;
-        while let Some((parent_path, entry)) = self.worklist.pop() {
-            let mut parent = &mut self.root;
-            for &i in &parent_path {
-                parent = &mut parent.children[i];
-            }
-            let idx = parent.children.len();
-            parent.child_index.insert(entry.name.clone(), idx);
-            parent
-                .children
-                .push(Node::new(entry.name, entry.path, entry.size, entry.is_dir));
-
-            let mut child_path = parent_path;
-            child_path.push(idx);
-            for child in entry.children {
-                self.worklist.push((child_path.clone(), child));
-                self.total += 1;
-            }
-
-            since_check += 1;
-            if since_check >= SCAN_BUDGET_CHECK_INTERVAL {
-                since_check = 0;
-                if started.elapsed() >= budget {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    /// Fraction of queued assembly work completed so far, in `[0.0, 1.0]`.
-    /// Exact, not an estimate — `total` counts every item ever queued.
-    fn progress(&self) -> f32 {
-        if self.total == 0 {
-            return 1.0;
-        }
-        let completed = self.total.saturating_sub(self.worklist.len());
-        completed as f32 / self.total as f32
-    }
-}
+/// The UI-side tree is shared with the egui-free display-tree preparation
+/// stage. Keeping the local alias preserves the existing rendering code while
+/// making descendant metadata, structural revisions, and deterministic child
+/// order part of the real tree model rather than app-only helpers.
+type Node = crate::display_tree::DisplayNode;
 
 /// The Turbo toggle's rendered state, derived from the MFT engine's capability
 /// check for the current scan target plus whether this process is already
@@ -380,6 +160,169 @@ fn resolve_nest_gate(abstraction: f32) -> NestGate {
         max_depth,
         min_side: MIN_NEST_SIDE * side_scale,
         min_area: MIN_NEST_AREA * side_scale * side_scale,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RectKey([u32; 4]);
+
+impl RectKey {
+    fn from_rect(rect: Rect) -> Self {
+        Self([
+            rect.left().to_bits(),
+            rect.top().to_bits(),
+            rect.width().to_bits(),
+            rect.height().to_bits(),
+        ])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GateKey {
+    max_depth: usize,
+    min_side: u32,
+    min_area: u32,
+}
+
+impl From<NestGate> for GateKey {
+    fn from(gate: NestGate) -> Self {
+        Self {
+            max_depth: gate.max_depth,
+            min_side: gate.min_side.to_bits(),
+            min_area: gate.min_area.to_bits(),
+        }
+    }
+}
+
+/// Inputs shared by all layouts in one visible treemap frame. A context
+/// change clears the cache because the focused root or viewport can change
+/// which branches are visible and where they are placed.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LayoutContextKey {
+    focus: Vec<String>,
+    viewport: RectKey,
+    gate: GateKey,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LayoutKey {
+    node_path: PathBuf,
+    structural_rev: u64,
+    rect: RectKey,
+    depth: usize,
+    gate: GateKey,
+}
+
+struct LayoutResult {
+    order: Vec<usize>,
+    rects: Vec<treemap::Rect>,
+}
+
+struct CachedLayout {
+    result: Rc<LayoutResult>,
+    last_used_generation: u64,
+}
+
+/// Reuses the expensive child ordering and squarified rectangles for the
+/// current visible treemap. Entries are keyed by the node's structural
+/// revision and exact geometry, then pruned after each frame so a long live
+/// scan cannot accumulate one layout for every historical tree revision.
+#[derive(Default)]
+struct TreemapLayoutCache {
+    context: Option<LayoutContextKey>,
+    generation: u64,
+    entries: HashMap<LayoutKey, CachedLayout>,
+    #[cfg(test)]
+    hits: usize,
+    #[cfg(test)]
+    misses: usize,
+}
+
+impl TreemapLayoutCache {
+    fn begin_frame(&mut self, focus: &[String], viewport: Rect, gate: NestGate) {
+        let context = LayoutContextKey {
+            focus: focus.to_vec(),
+            viewport: RectKey::from_rect(viewport),
+            gate: gate.into(),
+        };
+        if self.context.as_ref() != Some(&context) {
+            self.entries.clear();
+            self.context = Some(context);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.entries.clear();
+            self.generation = 1;
+        }
+    }
+
+    fn layout_for(
+        &mut self,
+        node: &Node,
+        rect: Rect,
+        depth: usize,
+        gate: NestGate,
+    ) -> Rc<LayoutResult> {
+        let key = LayoutKey {
+            node_path: node.path.clone(),
+            structural_rev: node.structural_rev(),
+            rect: RectKey::from_rect(rect),
+            depth,
+            gate: gate.into(),
+        };
+        if let Some(cached) = self.entries.get_mut(&key) {
+            cached.last_used_generation = self.generation;
+            #[cfg(test)]
+            {
+                self.hits += 1;
+            }
+            return Rc::clone(&cached.result);
+        }
+
+        let mut order: Vec<usize> = (0..node.children.len()).collect();
+        order.sort_unstable_by(|&a, &b| {
+            let left = &node.children[a];
+            let right = &node.children[b];
+            right
+                .size
+                .cmp(&left.size)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let sizes: Vec<u64> = order.iter().map(|&i| node.children[i].size).collect();
+        let rects = treemap::squarify(
+            &sizes,
+            treemap::Rect::new(rect.left(), rect.top(), rect.width(), rect.height()),
+        );
+        let result = Rc::new(LayoutResult { order, rects });
+        self.entries.insert(
+            key,
+            CachedLayout {
+                result: Rc::clone(&result),
+                last_used_generation: self.generation,
+            },
+        );
+        #[cfg(test)]
+        {
+            self.misses += 1;
+        }
+        result
+    }
+
+    fn finish_frame(&mut self) {
+        let generation = self.generation;
+        self.entries
+            .retain(|_, cached| cached.last_used_generation == generation);
+    }
+
+    fn clear(&mut self) {
+        self.context = None;
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (usize, usize, usize) {
+        (self.hits, self.misses, self.entries.len())
     }
 }
 
@@ -457,7 +400,7 @@ struct ScanSummary {
     elapsed: Duration,
 }
 
-/// The Insights drawer's computed analytics for one (focus, tree revision).
+/// The Insights drawer's computed analytics for one focused structural revision.
 /// Cached so the whole-subtree aggregations run once per change — not every
 /// frame (see the change's design doc) — and cloned cheaply for rendering.
 /// One exact filesystem target shared by treemap and Insights actions. The
@@ -469,6 +412,13 @@ struct ActionTarget {
     path: PathBuf,
     is_dir: bool,
     display_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InsightsKey {
+    focus: Vec<String>,
+    tree_identity: u64,
+    focused_structural_rev: u64,
 }
 
 /// A delete request staged by either UI entry point. Staging this value does
@@ -510,9 +460,9 @@ pub struct BytewhifferApp {
     /// when a folder is picked or when free-form text is resolved at action
     /// time; historical `last_scanned_path` never takes precedence over it.
     requested_target: Option<PathBuf>,
-    /// Generation currently being walked or assembled. Keeping this beside
-    /// the controller lets assembly reject a result that was superseded before
-    /// the next frame.
+    /// Generation currently being scanned or prepared. The controller owns
+    /// worker-side conversion before publishing completion, so this ID rejects
+    /// stale completion messages.
     scan_generation: Option<ScanId>,
     /// Name of the engine that produced, or is producing, the current scan.
     engine_name: Option<&'static str>,
@@ -533,24 +483,24 @@ pub struct BytewhifferApp {
     top_level_sizes: HashMap<String, u64>,
     biggest_top_level: Option<(String, u64)>,
     last_summary: Option<ScanSummary>,
-    /// The walk phase's final files/dirs/bytes counts, captured when the walk
-    /// thread returns but before tree assembly (`pending_assembly`) has
-    /// finished — these counters are already stable at that point (the engine
-    /// contract guarantees it), only `elapsed` still needs assembly to finish
-    /// before it means "total scan time". `advance_pending_assembly` takes
-    /// this and pairs it with a fresh `elapsed` to build the real
-    /// `last_summary` once assembly swaps the tree in.
-    pending_summary_counts: Option<(ScanId, u64, u64, u64)>,
     /// Whether the left-side Insights drawer is open. Closed by default so
     /// the treemap stays full-width until the user summons it.
     insights_open: bool,
     /// Bumped whenever `root` changes (scan start, live discovery, scan
-    /// completion, deletion) so the drawer can tell its cache is stale.
+    /// completion, deletion) so layout and density caches can tell their state
+    /// is stale. Insights uses the focused node's structural revision instead
+    /// of this global revision.
     tree_rev: u64,
-    /// Cached drawer analytics plus the (focus, tree_rev) they describe;
-    /// recomputed only when that key changes.
+    /// Monotonic identity for the currently installed root generation. A fresh
+    /// authoritative tree can start its node revisions at the same values as
+    /// the previous tree, so Insights must include this identity in its key.
+    tree_identity: u64,
+    /// Cached drawer analytics plus the focus, root identity, and focused-node
+    /// structural revision they describe; recomputed only when that key changes.
     insights_cache: Option<InsightsData>,
-    insights_key: Option<(Vec<String>, u64)>,
+    insights_key: Option<InsightsKey>,
+    #[cfg(test)]
+    insights_refreshes: usize,
     /// Cached "is the focused subtree dense enough for the cheap render tier?"
     /// decision, plus the (focus, tree_rev) it describes — recomputed only when
     /// that key changes, exactly like `insights_cache`. Keeps the descendant
@@ -570,6 +520,11 @@ pub struct BytewhifferApp {
     /// the pointer in abstract mode; `None` when nothing eligible is hovered.
     /// Purely presentational — never touches `focus`/breadcrumb state.
     preview: Option<PreviewOverlay>,
+    /// Reuses ordering and squarified rectangles across pointer-only repaints.
+    /// Keys include each node's structural revision and the current focus,
+    /// viewport, and resolved nesting gate, so mutations and posture changes
+    /// invalidate only the layouts that can no longer be trusted.
+    layout_cache: TreemapLayoutCache,
     /// Whether this process holds an elevated token. Detected once at startup
     /// (the UAC self-relaunch produces such a process); once true, turbo stays
     /// on for the rest of this process's lifetime and never re-prompts. Never
@@ -591,12 +546,6 @@ pub struct BytewhifferApp {
     /// Whether the "Turbo does not work for this drive" dialog is open (raised
     /// when an already-elevated process's target is non-NTFS).
     turbo_unsupported_open: bool,
-    /// An in-progress, resumable conversion of a just-completed scan's
-    /// authoritative `Entry` tree into the UI's `Node` shape, advanced a
-    /// budgeted step per frame by `advance_pending_assembly`. `self.root`
-    /// (the live tree) stays displayed and interactive until this finishes
-    /// and swaps in, atomically — see `PendingAssembly`.
-    pending_assembly: Option<PendingAssembly>,
 }
 
 impl BytewhifferApp {
@@ -683,7 +632,7 @@ impl BytewhifferApp {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| target.to_string_lossy().into_owned());
-        self.root = Some(Node::new(root_name, target.clone(), 0, true));
+        self.replace_root(Some(Node::new(root_name, target.clone(), 0, true)));
         self.focus.clear();
         self.hovered_path = None;
         self.hovered_size = None;
@@ -695,11 +644,8 @@ impl BytewhifferApp {
         self.smoothed_rate_bps = None;
         self.top_level_sizes.clear();
         self.biggest_top_level = None;
+        self.layout_cache.clear();
         self.tree_rev = self.tree_rev.wrapping_add(1);
-        // Discard any still-in-progress assembly from a previous scan — it
-        // describes a tree that no longer matches this new target.
-        self.pending_assembly = None;
-        self.pending_summary_counts = None;
 
         let id = self.scan_controller.start(target, engine);
         self.scan_generation = Some(id);
@@ -769,10 +715,6 @@ impl BytewhifferApp {
         }
     }
 
-    // guarantees final counts before returning) — only `elapsed`
-    // `advance_pending_assembly`) — never a partially-
-    // nothing further to wait on — finalize immediately.
-
     fn finish_scan(&mut self, completion: ScanCompletion) {
         if self.scan_generation != Some(completion.id) {
             return;
@@ -780,119 +722,85 @@ impl BytewhifferApp {
         let files = completion.progress.files_scanned.load(Ordering::Relaxed);
         let dirs = completion.progress.dirs_scanned.load(Ordering::Relaxed);
         let bytes = completion.progress.bytes_scanned.load(Ordering::Relaxed);
+        let elapsed = self
+            .scan_started_at
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
         self.engine_name = Some(completion.engine_name);
+        self.layout_cache.clear();
 
         match completion.outcome {
-            ScanOutcome::Success(entry) => {
-                self.pending_assembly = Some(PendingAssembly::start_for(completion.id, entry));
-                self.pending_summary_counts = Some((completion.id, files, dirs, bytes));
+            PreparedOutcome::Success(root) => {
+                // The controller prepares the complete display tree before
+                // publishing this message. Install it atomically so the
+                // provisional live tree is never replaced by a partial one.
+                self.replace_root(Some(root));
+                if let Some(root) = &self.root {
+                    if root.find(&self.focus).is_none() {
+                        self.focus.clear();
+                    }
+                }
+                self.last_summary = Some(ScanSummary {
+                    files,
+                    dirs,
+                    bytes,
+                    elapsed,
+                });
+                self.tree_rev = self.tree_rev.wrapping_add(1);
             }
-            ScanOutcome::Cancelled => {
-                self.pending_assembly = None;
-                self.pending_summary_counts = None;
-                self.root = None;
+            PreparedOutcome::Cancelled => {
+                self.replace_root(None);
                 self.focus.clear();
                 self.tree_rev = self.tree_rev.wrapping_add(1);
             }
-            ScanOutcome::Failed(err) => {
+            PreparedOutcome::Failed(err) => {
                 self.error = Some(match err {
                     ScanError::Unavailable(a) => {
                         format!("Scan engine unavailable for this target: {a:?}")
                     }
                     ScanError::RootUnreadable(e) => format!("Cannot read that folder: {e}"),
                 });
-                self.pending_assembly = None;
-                self.pending_summary_counts = None;
-                self.root = None;
+                self.replace_root(None);
                 self.tree_rev = self.tree_rev.wrapping_add(1);
                 self.last_summary = Some(ScanSummary {
                     files,
                     dirs,
                     bytes,
-                    elapsed: self
-                        .scan_started_at
-                        .map(|t| t.elapsed())
-                        .unwrap_or_default(),
+                    elapsed,
                 });
             }
-            ScanOutcome::Panicked => {
+            PreparedOutcome::Panicked => {
                 self.error = Some("The scan thread panicked.".to_owned());
-                self.pending_assembly = None;
-                self.pending_summary_counts = None;
-                self.root = None;
+                self.replace_root(None);
                 self.tree_rev = self.tree_rev.wrapping_add(1);
                 self.last_summary = Some(ScanSummary {
                     files,
                     dirs,
                     bytes,
-                    elapsed: self
-                        .scan_started_at
-                        .map(|t| t.elapsed())
-                        .unwrap_or_default(),
+                    elapsed,
                 });
             }
         }
-    }
-
-    /// Advances the in-progress authoritative-tree assembly (if any) by one
-    /// budgeted step. Called every frame regardless of whether a scan is
-    /// still running, since assembly continues in the background after the
-    /// scan thread itself has already finished. Swaps `self.root` for the
-    /// finished tree in one atomic replace the moment assembly completes;
-    /// until then the existing live tree stays displayed and interactive.
-    /// This is also the point `last_summary` is finalized (see
-    /// `pending_summary_counts`) — its `elapsed` reflects total scan time
-    /// including assembly, not just the walk.
-    fn advance_pending_assembly(&mut self) {
-        if self
-            .pending_assembly
-            .as_ref()
-            .is_some_and(|assembly| self.scan_generation != Some(assembly.id))
-        {
-            self.pending_assembly = None;
-            self.pending_summary_counts = None;
-            return;
-        }
-        let Some(assembly) = &mut self.pending_assembly else {
-            return;
-        };
-        if !assembly.step(SCAN_FRAME_BUDGET) {
-            return;
-        }
-        let assembly = self.pending_assembly.take().unwrap();
-        self.root = Some(assembly.root);
-        if let Some(root) = &self.root {
-            if root.find(&self.focus).is_none() {
-                self.focus.clear();
-            }
-        }
-        if let Some((id, files, dirs, bytes)) = self.pending_summary_counts.take() {
-            if id == assembly.id {
-                self.last_summary = Some(ScanSummary {
-                    files,
-                    dirs,
-                    bytes,
-                    elapsed: self
-                        .scan_started_at
-                        .map(|t| t.elapsed())
-                        .unwrap_or_default(),
-                });
-            }
-        }
-        self.tree_rev = self.tree_rev.wrapping_add(1);
     }
 
     /// Whether the HUD-visible "still working" state should be considered
-    /// active — covers both the background walk and the authoritative-tree
-    /// assembly that can keep running after the walk thread returns. Drives
-    /// `scan_hud`'s visibility, the live-elapsed clock, and `status_bar`'s
-    /// decision to stay quiet about a finalized summary.
-    fn scan_or_assembly_active(&self) -> bool {
-        self.scan_controller.is_active() || self.pending_assembly.is_some()
+    /// active. The controller keeps a generation current through both the
+    /// scanner walk and worker-side display-tree preparation, so completion
+    /// is the single point at which the HUD can disappear.
+    fn scan_active(&self) -> bool {
+        self.scan_controller.is_active()
+    }
+
+    fn replace_root(&mut self, root: Option<Node>) {
+        self.root = root;
+        self.tree_identity = self.tree_identity.wrapping_add(1);
+        if self.tree_identity == 0 {
+            self.tree_identity = 1;
+        }
     }
 
     fn delete_available(&self) -> bool {
-        !self.scan_or_assembly_active()
+        !self.scan_active()
     }
 
     /// Cancels a staged delete without touching the filesystem or visible tree.
@@ -1029,17 +937,12 @@ impl BytewhifferApp {
         });
     }
 
-    /// In-flight scan HUD, covering both phases of a scan: the background
-    /// walk (indeterminate progress, since the walker can't know a total
-    /// size ahead of time) and, once the walk finishes, the authoritative-
-    /// tree assembly that can keep running for more frames on a large tree
-    /// (real completion progress, since assembly's total item count is known
-    /// as it's queued — see `PendingAssembly::progress`). Shown for as long
-    /// as `scan_or_assembly_active()` is true; owns these figures exclusively
-    /// so the bottom status bar can stay quiet about them until both phases
-    /// are done.
+    /// In-flight scan HUD. The controller remains active while either the
+    /// scanner walk or worker-side display-tree preparation runs. Preparation
+    /// publishes conversion progress through the shared progress state, so
+    /// the UI never owns the conversion work or a partial authoritative tree.
     fn scan_hud(&mut self, ui: &mut egui::Ui) {
-        if !self.scan_or_assembly_active() {
+        if !self.scan_active() {
             return;
         }
         let elapsed = self
@@ -1050,10 +953,33 @@ impl BytewhifferApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
 
-            if let Some(progress) = self.scan_controller.current_progress() {
-                let files = progress.files_scanned.load(Ordering::Relaxed);
-                let dirs = progress.dirs_scanned.load(Ordering::Relaxed);
-                let bytes = progress.bytes_scanned.load(Ordering::Relaxed);
+            let Some(progress) = self.scan_controller.current_progress() else {
+                mono_label(ui, theme::TEXT_SUBTLE, format_duration_live(elapsed));
+                return;
+            };
+            let files = progress.files_scanned.load(Ordering::Relaxed);
+            let dirs = progress.dirs_scanned.load(Ordering::Relaxed);
+            let bytes = progress.bytes_scanned.load(Ordering::Relaxed);
+
+            if progress.conversion_started() {
+                ui.add(
+                    egui::ProgressBar::new(progress.conversion_progress())
+                        .desired_width(110.0)
+                        .desired_height(6.0)
+                        .fill(theme::ACCENT),
+                );
+                ui.colored_label(theme::TEXT_SUBTLE, "Preparing…");
+                mono_label(
+                    ui,
+                    theme::TEXT_SUBTLE,
+                    format!(
+                        "{} files · {} dirs · {}",
+                        files,
+                        dirs,
+                        format_size_precise(bytes)
+                    ),
+                );
+            } else {
                 let rate = self.smoothed_rate_bps.unwrap_or(0.0);
                 let biggest = self.biggest_top_level.clone();
 
@@ -1073,7 +999,9 @@ impl BytewhifferApp {
                     ui,
                     theme::TEXT_SUBTLE,
                     format!(
-                        "{files} files · {dirs} dirs · {}",
+                        "{} files · {} dirs · {}",
+                        files,
+                        dirs,
                         format_size_precise(bytes)
                     ),
                 );
@@ -1088,24 +1016,6 @@ impl BytewhifferApp {
                         format!("Largest so far: {name} ({})", format_size(size)),
                     );
                 }
-            } else if let Some(assembly) = &self.pending_assembly {
-                // The walk has finished; only tree assembly remains. Unlike
-                // the walk's indeterminate bar, assembly's total item count
-                // is known as it's queued, so this shows real progress.
-                ui.add(
-                    egui::ProgressBar::new(assembly.progress())
-                        .desired_width(110.0)
-                        .desired_height(6.0)
-                        .fill(theme::ACCENT),
-                );
-                ui.colored_label(theme::TEXT_SUBTLE, "Finishing up…");
-                if let Some((_, files, dirs, bytes)) = self.pending_summary_counts {
-                    mono_label(
-                        ui,
-                        theme::TEXT_SUBTLE,
-                        format!("{files} files · {dirs} dirs · {}", format_size(bytes)),
-                    );
-                }
             }
 
             mono_label(ui, theme::TEXT_SUBTLE, format_duration_live(elapsed));
@@ -1115,11 +1025,8 @@ impl BytewhifferApp {
     /// Persistent bottom status bar: a hover readout on the left (mirrors
     /// the block tooltip but never disappears), and on the right a scan
     /// summary that survives past scan completion plus the engine name.
-    /// Goes quiet about live counts while a scan or its tree assembly is
-    /// still in progress, since the HUD above already owns those — the
-    /// summary shown here isn't finalized until `advance_pending_assembly`
-    /// swaps the assembled tree in, so it never shows a final-looking number
-    /// before the map has actually finished updating.
+    /// Goes quiet about live counts while a scan or worker-side tree
+    /// preparation is in progress, since the HUD above already owns those.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -1140,8 +1047,6 @@ impl BytewhifferApp {
                 }
                 if self.scan_controller.is_active() {
                     ui.colored_label(theme::TEXT_SUBTLE, "Scanning…");
-                } else if self.pending_assembly.is_some() {
-                    ui.colored_label(theme::TEXT_SUBTLE, "Finishing up…");
                 } else if let Some(summary) = &self.last_summary {
                     ui.colored_label(
                         theme::TEXT_SUBTLE,
@@ -1230,6 +1135,7 @@ impl BytewhifferApp {
         };
 
         if focus_node.children.is_empty() {
+            self.layout_cache.clear();
             let msg = if self.scan_controller.is_active() {
                 "Scanning…"
             } else {
@@ -1246,16 +1152,21 @@ impl BytewhifferApp {
         }
 
         let mut hits: Vec<HitRect> = Vec::new();
+        let treemap_rect = avail.shrink(BLOCK_PAD);
+        self.layout_cache
+            .begin_frame(&self.focus, treemap_rect, gate);
         draw_children(
             &painter,
             focus_node,
-            avail.shrink(BLOCK_PAD),
+            treemap_rect,
             0,
             &mut Vec::new(),
             &mut hits,
             dense,
             gate,
+            &mut self.layout_cache,
         );
+        self.layout_cache.finish_frame();
 
         // Deepest block under the pointer wins: children are pushed after
         // their parents, so the last containing rect is the innermost.
@@ -1454,8 +1365,9 @@ impl BytewhifferApp {
                 let removed = self
                     .root
                     .as_mut()
-                    .and_then(|root| root.remove(&target.trail));
-                if removed.is_some() {
+                    .map(|root| root.remove(&target.trail))
+                    .unwrap_or(false);
+                if removed {
                     self.tree_rev = self.tree_rev.wrapping_add(1);
                     self.repair_focus_after_removal(&target.trail);
                 }
@@ -1485,10 +1397,9 @@ impl BytewhifferApp {
     }
 
     /// Recomputes whether the focused subtree is dense enough to warrant the
-    /// cheap (flat-rounded) render tier, if the focus or tree changed since it
-    /// was last computed; a no-op otherwise. Mirrors `refresh_insights`: the
-    /// whole-subtree descendant count runs once per change, never per frame, so
-    /// a frame driven purely by pointer movement never pays for it.
+    /// cheap (flat-rounded) render tier when focus or tree structure changes;
+    /// a no-op otherwise. The descendant count is maintained by `DisplayNode`,
+    /// so pointer-only frames read cached metadata without a subtree walk.
     fn refresh_density(&mut self) {
         let key = (self.focus.clone(), self.tree_rev);
         if self.density_key.as_ref() == Some(&key) {
@@ -1510,13 +1421,27 @@ impl BytewhifferApp {
         resolve_nest_gate(self.abstraction)
     }
 
-    /// Recomputes the drawer's analytics if the focus or the tree has
-    /// changed since they were last computed; a no-op otherwise. Keeps the
-    /// whole-subtree walks off the per-frame render path.
+    /// Recomputes the drawer's analytics if the focus, authoritative root, or
+    /// focused subtree structure has changed since they were last computed; a
+    /// no-op otherwise. Keeps the whole-subtree walks off the per-frame render
+    /// path.
     fn refresh_insights(&mut self) {
-        let key = (self.focus.clone(), self.tree_rev);
+        let focused_structural_rev = self
+            .root
+            .as_ref()
+            .map(|root| root.find(&self.focus).unwrap_or(root).structural_rev())
+            .unwrap_or(0);
+        let key = InsightsKey {
+            focus: self.focus.clone(),
+            tree_identity: self.tree_identity,
+            focused_structural_rev,
+        };
         if self.insights_cache.is_some() && self.insights_key.as_ref() == Some(&key) {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.insights_refreshes += 1;
         }
         let data = {
             let Some(root) = &self.root else {
@@ -1526,14 +1451,16 @@ impl BytewhifferApp {
             };
             // Describe whatever the treemap is currently showing — the same
             // node `treemap_panel` resolves via `root.find(&self.focus)`.
+            // `aggregate` visits this borrowed tree once for every drawer
+            // section and keeps only the bounded leaderboard candidates.
             let focus_node = root.find(&self.focus).unwrap_or(root);
-            let view = to_insight(focus_node);
+            let summary = insights::aggregate(focus_node, LEADERBOARD_N);
             InsightsData {
-                ext_totals: view.extension_totals(),
-                leaderboard: view.leaderboard(LEADERBOARD_N),
-                blizzard: view.blizzard_flags(),
-                cleanup_candidates: view.cleanup_candidates(),
-                total_size: view.size,
+                ext_totals: summary.ext_totals,
+                leaderboard: summary.leaderboard,
+                blizzard: summary.blizzard,
+                cleanup_candidates: summary.cleanup_candidates,
+                total_size: summary.total_size,
             }
         };
         self.insights_cache = Some(data);
@@ -1930,13 +1857,10 @@ impl BytewhifferApp {
             // the final frame rather than hanging forever.
         }
 
-        // Also wait out the resumable authoritative-tree assembly — the
+        // Also wait for worker-side display-tree preparation — the
         // "Final"/"Drill" captures should show the finished tree, not a
-        // still-live one mid-swap.
-        if !self.scan_controller.is_active()
-            && self.pending_assembly.is_none()
-            && self.root.is_some()
-        {
+        // still-live one before the atomic handoff.
+        if !self.scan_controller.is_active() && self.root.is_some() {
             if mode == DebugShotMode::Drill && !self.debug_shot.as_ref().unwrap().drilled {
                 // Focus the root's largest directory child, as a click would.
                 if let Some(root) = &self.root {
@@ -1976,11 +1900,9 @@ impl eframe::App for BytewhifferApp {
             self.start_scan(root);
         }
         self.drain_scan();
-        self.advance_pending_assembly();
-        if self.scan_controller.is_active() || self.pending_assembly.is_some() {
-            // Keep repainting while the scan streams events, or the
-            // authoritative tree is still assembling in the background, so
-            // both visibly progress without waiting for input.
+        if self.scan_controller.is_active() {
+            // Keep repainting while the scan streams events or the worker
+            // prepares the authoritative display tree.
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -1988,7 +1910,7 @@ impl eframe::App for BytewhifferApp {
             ui.add_space(4.0);
             self.toolbar(ui);
             ui.add_space(2.0);
-            if self.scan_or_assembly_active() {
+            if self.scan_active() {
                 self.scan_hud(ui);
                 ui.add_space(2.0);
             }
@@ -2023,19 +1945,6 @@ impl eframe::App for BytewhifferApp {
         self.turbo_warning_window(&ctx);
         self.turbo_unsupported_window(&ctx);
         self.confirm_pending_delete(&ctx);
-    }
-}
-
-/// Borrows a live-UI `Node` subtree into the egui-free insight view the
-/// `insights` module aggregates over. Cheap: a shallow walk that borrows
-/// names/paths rather than copying them.
-fn to_insight(node: &Node) -> insights::InsightNode<'_> {
-    insights::InsightNode {
-        name: &node.name,
-        path: &node.path,
-        size: node.size,
-        is_dir: node.is_dir,
-        children: node.children.iter().map(to_insight).collect(),
     }
 }
 
@@ -2232,24 +2141,17 @@ fn draw_children(
     hits: &mut Vec<HitRect>,
     dense: bool,
     gate: NestGate,
+    layout_cache: &mut TreemapLayoutCache,
 ) {
     if node.children.is_empty() || rect.width() < 1.0 || rect.height() < 1.0 {
         return;
     }
 
-    // The live tree arrives unsorted; sort per visible node per frame.
-    let mut order: Vec<usize> = (0..node.children.len()).collect();
-    order.sort_by(|&a, &b| node.children[b].size.cmp(&node.children[a].size));
-    let sizes: Vec<u64> = order.iter().map(|&i| node.children[i].size).collect();
+    let layout = layout_cache.layout_for(node, rect, depth, gate);
 
-    let layout = treemap::squarify(
-        &sizes,
-        treemap::Rect::new(rect.left(), rect.top(), rect.width(), rect.height()),
-    );
-
-    for (k, &i) in order.iter().enumerate() {
+    for (k, &i) in layout.order.iter().enumerate() {
         let child = &node.children[i];
-        let r = layout[k];
+        let r = layout.rects[k];
         if r.w <= 0.0 || r.h <= 0.0 {
             continue;
         }
@@ -2333,6 +2235,7 @@ fn draw_children(
                 hits,
                 dense,
                 gate,
+                layout_cache,
             );
 
             for _ in 0..chain_len {
@@ -3252,152 +3155,200 @@ mod abstraction_tests {
 }
 
 #[cfg(test)]
-mod scan_responsiveness_tests {
+mod layout_cache_tests {
     use super::*;
 
-    /// Builds a synthetic `Entry` tree `depth` levels deep, each directory
-    /// branching into `fanout` children (the deepest level all files), so a
-    /// resumable assembly of it needs many more than `SCAN_BUDGET_CHECK_INTERVAL`
-    /// items — and therefore several simulated "frames" at a tiny budget.
-    fn build_entry_tree(name: &str, depth: usize, fanout: usize) -> Entry {
-        if depth == 0 {
-            return Entry {
-                name: name.to_string(),
-                path: PathBuf::from(name),
-                size: 4096,
-                is_dir: false,
-                children: Vec::new(),
-            };
-        }
-        let children: Vec<Entry> = (0..fanout)
-            .map(|i| build_entry_tree(&format!("{name}_{i}"), depth - 1, fanout))
-            .collect();
-        let size = children.iter().map(|c| c.size).sum();
-        Entry {
-            name: name.to_string(),
-            path: PathBuf::from(name),
-            size,
-            is_dir: true,
-            children,
-        }
+    fn node(name: &str, path: &str) -> Node {
+        let mut node = Node::new(name.to_owned(), PathBuf::from(path), 0, true);
+        node.insert(Path::new("first.bin"), 10, false);
+        node.insert(Path::new("second.bin"), 5, false);
+        node
     }
 
-    /// Order-independent structural comparison: same name/path/size/is_dir,
-    /// same child count, and every child in `a` has a matching (recursively
-    /// equivalent) child in `b` by name. Insertion order of `Node::children`
-    /// carries no meaning anywhere in the app (`draw_children` re-sorts by
-    /// size every frame), and the resumable assembly's worklist-based
-    /// traversal deliberately doesn't preserve the recursive one-shot
-    /// build's sibling order — so this is the right notion of "matches",
-    /// not a plain derived `Vec` equality.
-    fn trees_equivalent(a: &Node, b: &Node) -> bool {
-        if a.name != b.name || a.path != b.path || a.size != b.size || a.is_dir != b.is_dir {
-            return false;
-        }
-        if a.children.len() != b.children.len() {
-            return false;
-        }
-        a.children.iter().all(|child| {
-            b.child_index
-                .get(&child.name)
-                .is_some_and(|&bi| trees_equivalent(child, &b.children[bi]))
-        })
+    fn viewport() -> Rect {
+        Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(800.0, 500.0))
     }
 
     #[test]
-    fn resumable_assembly_matches_one_shot_reference_build() {
-        let tree = build_entry_tree("root", 4, 5); // 5^4 = 625 leaves, 781 entries total
-        let reference = Node::from_entry(&tree);
+    fn reuses_unchanged_layouts_and_prunes_unseen_entries() {
+        let root = node("root", "root");
+        let sibling = node("sibling", "sibling");
+        let focus = Vec::new();
+        let gate = resolve_nest_gate(0.0);
+        let rect = viewport();
+        let mut cache = TreemapLayoutCache::default();
 
-        // A near-zero budget forces `step` to bail after every batch of
-        // `SCAN_BUDGET_CHECK_INTERVAL` items, simulating many small frames
-        // rather than one big one.
-        let mut assembly = PendingAssembly::start_for(0, tree);
-        let mut frames = 0usize;
-        loop {
-            frames += 1;
-            assert!(
-                frames < 10_000,
-                "assembly should finish well before this many frames"
-            );
-            if assembly.step(Duration::from_nanos(1)) {
-                break;
+        cache.begin_frame(&focus, rect, gate);
+        let first = cache.layout_for(&root, rect, 0, gate);
+        cache.layout_for(&sibling, rect, 0, gate);
+        cache.finish_frame();
+        assert_eq!(cache.stats(), (0, 2, 2));
+
+        cache.begin_frame(&focus, rect, gate);
+        let reused = cache.layout_for(&root, rect, 0, gate);
+        cache.finish_frame();
+
+        assert!(Rc::ptr_eq(&first, &reused));
+        assert_eq!(cache.stats(), (1, 2, 1));
+    }
+
+    #[test]
+    fn insertion_size_change_and_removal_invalidate_layout() {
+        let mut root = node("root", "root");
+        let focus = Vec::new();
+        let gate = resolve_nest_gate(0.0);
+        let rect = viewport();
+        let mut cache = TreemapLayoutCache::default();
+
+        for expected_misses in 1..=4 {
+            cache.begin_frame(&focus, rect, gate);
+            cache.layout_for(&root, rect, 0, gate);
+            cache.finish_frame();
+            assert_eq!(cache.stats(), (0, expected_misses, 1));
+
+            match expected_misses {
+                1 => root.insert(Path::new("new.bin"), 20, false),
+                2 => root.insert(Path::new("first.bin"), 3, false),
+                3 => assert!(root.remove(&["new.bin".to_owned()])),
+                _ => {}
             }
         }
-        assert!(
-            frames > 1,
-            "a tree this size should need more than one simulated frame at a near-zero budget"
-        );
-        assert!(
-            trees_equivalent(&assembly.root, &reference),
-            "paced multi-frame assembly must match a one-shot reference build: same sizes, \
-             structure, and child counts"
-        );
     }
 
     #[test]
-    fn resumable_assembly_completes_a_small_tree_in_one_step() {
-        let tree = build_entry_tree("root", 2, 3);
-        let reference = Node::from_entry(&tree);
+    fn unrelated_branch_reuses_its_layout_after_a_sibling_mutates() {
+        let mut changed = node("changed", "changed");
+        let stable = node("stable", "stable");
+        let focus = Vec::new();
+        let gate = resolve_nest_gate(0.0);
+        let rect = viewport();
+        let mut cache = TreemapLayoutCache::default();
 
-        let mut assembly = PendingAssembly::start_for(0, tree);
-        assert!(
-            assembly.step(SCAN_FRAME_BUDGET),
-            "a small tree should assemble within the normal per-frame budget in one call"
-        );
-        assert!(trees_equivalent(&assembly.root, &reference));
+        cache.begin_frame(&focus, rect, gate);
+        cache.layout_for(&changed, rect, 0, gate);
+        let stable_first = cache.layout_for(&stable, rect, 0, gate);
+        cache.finish_frame();
+
+        changed.insert(Path::new("new.bin"), 20, false);
+        cache.begin_frame(&focus, rect, gate);
+        cache.layout_for(&changed, rect, 0, gate);
+        let stable_reused = cache.layout_for(&stable, rect, 0, gate);
+        cache.finish_frame();
+
+        assert!(Rc::ptr_eq(&stable_first, &stable_reused));
+        assert_eq!(cache.stats(), (1, 3, 2));
     }
 
     #[test]
-    fn assembly_progress_rises_monotonically_to_one() {
-        let tree = build_entry_tree("root", 4, 5); // needs several simulated frames
-        let mut assembly = PendingAssembly::start_for(0, tree);
-        assert!(
-            assembly.progress() < 1.0,
-            "freshly-started assembly with queued work should not already read complete"
-        );
+    fn focus_viewport_and_abstraction_changes_invalidate_context() {
+        let root = node("root", "root");
+        let rect = viewport();
+        let other_rect = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(801.0, 500.0));
+        let detail = resolve_nest_gate(0.0);
+        let abstracted = resolve_nest_gate(1.0);
+        let mut cache = TreemapLayoutCache::default();
 
-        let mut last = assembly.progress();
-        loop {
-            let done = assembly.step(Duration::from_nanos(1));
-            let now = assembly.progress();
-            assert!(
-                now >= last,
-                "progress must never go backwards across steps ({last} -> {now})"
-            );
-            last = now;
-            if done {
-                break;
-            }
+        let contexts = [
+            (Vec::new(), rect, detail),
+            (vec!["focused".to_owned()], rect, detail),
+            (vec!["focused".to_owned()], other_rect, detail),
+            (vec!["focused".to_owned()], other_rect, abstracted),
+        ];
+        for (focus, viewport, gate) in contexts {
+            cache.begin_frame(&focus, viewport, gate);
+            cache.layout_for(&root, viewport, 0, gate);
+            cache.finish_frame();
         }
-        assert_eq!(
-            assembly.progress(),
-            1.0,
-            "a finished assembly reads as fully complete"
-        );
+
+        assert_eq!(cache.stats(), (0, 4, 1));
+    }
+}
+
+#[cfg(test)]
+mod insights_cache_tests {
+    use super::*;
+
+    fn tree() -> Node {
+        let mut root = Node::new("root".to_owned(), PathBuf::from("root"), 0, true);
+        root.insert(Path::new("focused/old.bin"), 10, false);
+        root.insert(Path::new("sibling/old.bin"), 20, false);
+        root
+    }
+
+    fn prepared_app() -> BytewhifferApp {
+        let mut app = BytewhifferApp::new();
+        app.replace_root(Some(tree()));
+        app
     }
 
     #[test]
-    fn assembly_progress_is_complete_for_a_childless_root() {
-        let tree = Entry {
-            name: "lonely".to_string(),
-            path: PathBuf::from("lonely"),
-            size: 0,
-            is_dir: true,
-            children: Vec::new(),
-        };
-        let assembly = PendingAssembly::start_for(0, tree);
-        assert_eq!(
-            assembly.progress(),
-            1.0,
-            "nothing queued means nothing left to finish"
+    fn pointer_only_frames_reuse_insights() {
+        let mut app = prepared_app();
+
+        app.refresh_insights();
+        app.refresh_insights();
+
+        assert_eq!(app.insights_refreshes, 1);
+    }
+
+    #[test]
+    fn sibling_mutation_reuses_focused_insights() {
+        let mut app = prepared_app();
+        app.focus = vec!["focused".to_owned()];
+        app.refresh_insights();
+
+        app.root
+            .as_mut()
+            .unwrap()
+            .insert(Path::new("sibling/new.bin"), 30, false);
+        app.tree_rev = app.tree_rev.wrapping_add(1);
+        app.refresh_insights();
+
+        assert_eq!(app.insights_refreshes, 1);
+    }
+
+    #[test]
+    fn mutation_under_focus_invalidates_insights() {
+        let mut app = prepared_app();
+        app.focus = vec!["focused".to_owned()];
+        app.refresh_insights();
+
+        app.root
+            .as_mut()
+            .unwrap()
+            .insert(Path::new("focused/new.bin"), 30, false);
+        app.tree_rev = app.tree_rev.wrapping_add(1);
+        app.refresh_insights();
+
+        assert_eq!(app.insights_refreshes, 2);
+    }
+
+    #[test]
+    fn authoritative_root_replacement_invalidates_matching_revisions() {
+        let mut app = prepared_app();
+        app.refresh_insights();
+        let old_revision = app.root.as_ref().unwrap().structural_rev();
+
+        let mut replacement = Node::new(
+            "replacement".to_owned(),
+            PathBuf::from("replacement"),
+            0,
+            true,
         );
+        replacement.insert(Path::new("first.bin"), 10, false);
+        replacement.insert(Path::new("second.bin"), 20, false);
+        app.replace_root(Some(replacement));
+        assert_eq!(app.root.as_ref().unwrap().structural_rev(), old_revision);
+        app.refresh_insights();
+
+        assert_eq!(app.insights_refreshes, 2);
     }
 }
 
 #[cfg(test)]
 mod scan_lifecycle_ui_tests {
     use super::*;
+    use crate::scanner::ScanOutcome;
 
     struct ImmediateEngine;
 
@@ -3501,15 +3452,17 @@ mod scan_lifecycle_ui_tests {
     }
 
     #[test]
-    fn delete_is_gated_during_scan_and_authoritative_assembly() {
+    fn delete_is_gated_during_scan() {
         let mut app = BytewhifferApp::new();
         app.scan_controller
             .start(PathBuf::from("scan"), Box::new(ImmediateEngine));
         assert!(!app.delete_available());
         app.scan_controller.cancel_current();
 
+        let mut completed = false;
         for _ in 0..10_000 {
             if app.scan_controller.poll_completion().is_some() {
+                completed = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -3519,19 +3472,7 @@ mod scan_lifecycle_ui_tests {
             "cancelled test scan should be fully retired before assembly gating is checked"
         );
 
-        app.scan_generation = Some(7);
-        app.pending_assembly = Some(PendingAssembly::start_for(
-            7,
-            Entry {
-                name: "root".to_owned(),
-                path: PathBuf::from("root"),
-                size: 0,
-                is_dir: true,
-                children: Vec::new(),
-            },
-        ));
-        assert!(!app.delete_available());
-        app.pending_assembly = None;
+        assert!(completed, "cancelled scan did not publish completion");
         assert!(app.delete_available());
     }
 }
@@ -3579,7 +3520,7 @@ mod delete_action_tests {
         );
         let mut root = Node::from_entry(&entry);
 
-        assert_eq!(root.remove(&["alpha".into(), "a.bin".into()]), Some(7));
+        assert!(root.remove(&["alpha".into(), "a.bin".into()]));
         assert_eq!(root.size, 24);
         assert_eq!(root.find(&["alpha".into()]).unwrap().size, 11);
         let alpha = root.find(&["alpha".into()]).unwrap();
@@ -3592,7 +3533,7 @@ mod delete_action_tests {
         let entry = dir("root", vec![file("first.bin", 5), file("second.bin", 9)]);
         let mut root = Node::from_entry(&entry);
 
-        assert_eq!(root.remove(&["first.bin".into()]), Some(5));
+        assert!(root.remove(&["first.bin".into()]));
         assert_eq!(root.size, 9);
         assert_eq!(root.child_index.get("second.bin"), Some(&0));
         assert!(root.find(&["first.bin".into()]).is_none());
@@ -3609,7 +3550,7 @@ mod delete_action_tests {
             .map(|child| child.name.clone())
             .collect();
 
-        assert_eq!(root.remove(&["alpha".into(), "missing.bin".into()]), None);
+        assert!(!root.remove(&["alpha".into(), "missing.bin".into()]));
         assert_eq!(root.size, before_size);
         assert_eq!(
             root.children
@@ -3638,7 +3579,7 @@ mod delete_action_tests {
         };
         let mut root = Node::from_entry(&entry);
 
-        assert_eq!(root.remove(&["huge.bin".into()]), Some(u64::MAX));
+        assert!(root.remove(&["huge.bin".into()]));
         assert_eq!(root.size, 0);
     }
 
@@ -3663,21 +3604,37 @@ mod delete_action_tests {
         assert!(app.error.is_none());
     }
 
+    struct BlockingDeleteEngine;
+
+    impl ScanEngine for BlockingDeleteEngine {
+        fn name(&self) -> &'static str {
+            "delete-test"
+        }
+
+        fn is_available(&self, _target: &Path) -> Availability {
+            Availability::Available
+        }
+
+        fn scan(
+            &self,
+            _target: &Path,
+            ctx: &crate::scanner::ScanContext,
+        ) -> crate::scanner::ScanOutcome {
+            while !ctx.is_cancelled() {
+                std::thread::yield_now();
+            }
+            crate::scanner::ScanOutcome::Cancelled
+        }
+    }
+
     #[test]
-    fn stale_pending_delete_is_cancelled_when_assembly_starts() {
+    fn stale_pending_delete_is_cancelled_when_scan_starts() {
         let mut app = BytewhifferApp::new();
         app.pending_delete = Some(target(&["keep.bin"], false));
-        app.pending_assembly = Some(PendingAssembly::start_for(
-            1,
-            Entry {
-                name: "root".to_owned(),
-                path: PathBuf::from("root"),
-                size: 0,
-                is_dir: true,
-                children: Vec::new(),
-            },
-        ));
+        app.scan_controller
+            .start(PathBuf::from("scan"), Box::new(BlockingDeleteEngine));
 
+        assert!(!app.delete_available());
         assert!(app.clear_pending_delete_if_unavailable());
         assert!(app.pending_delete.is_none());
     }

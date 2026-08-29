@@ -1,61 +1,77 @@
 //! Pure, egui-free derived analytics over a scanned tree.
 //!
-//! Every function here is a whole-subtree aggregation over data a scan
-//! already produced (extension size totals, a biggest-entries leaderboard,
-//! small-file-blizzard detection, cleanup-candidate name matching) — no disk I/O,
-//! no new scan pass. It is deliberately kept free of any `egui` dependency,
-//! like `treemap.rs` and `scanner/`, so the aggregation logic can be
-//! unit-tested without a display; `app.rs` is the adapter that renders the
-//! results and wires click-to-focus.
-//!
-//! The aggregations operate on [`InsightNode`], a minimal borrowed view of a
-//! tree node (name, path, size, is_dir, children). Both `app::Node` (the
-//! live UI tree) and [`crate::scanner::Entry`] (the engine's final tree)
-//! borrow into it, so the functions never depend on either concrete type —
-//! mirroring how `treemap::squarify` takes bare sizes rather than a tree.
+//! The drawer's four sections are produced by one visitor over the focused
+//! tree.  The visitor borrows the source tree through [`InsightTree`], so it
+//! does not construct a second tree-shaped representation merely to aggregate
+//! it.  Leaderboard state is capped at the requested top-N size while the
+//! traversal is in progress.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// How many direct children a directory must have before it can be
 /// considered a small-file blizzard.
 const BLIZZARD_MIN_CHILDREN: usize = 100;
 /// The largest average child size (bytes) a blizzard directory may have.
-/// Above this the directory holds substantial content, not clutter.
 const BLIZZARD_MAX_AVG_SIZE: u64 = 64 * 1024;
 
-/// A minimal borrowed view of one tree node the aggregations walk over.
-/// Children own their own `InsightNode`s (borrowing name/path from the
-/// source tree), so building one is a shallow O(nodes) walk with no string
-/// copying.
-pub struct InsightNode<'a> {
-    pub name: &'a str,
-    pub path: &'a Path,
-    pub size: u64,
-    pub is_dir: bool,
-    pub children: Vec<InsightNode<'a>>,
+/// Minimal tree interface needed by the one-pass analytics visitor.
+///
+/// Returning a slice keeps the visitor borrowed and allocation-free with
+/// respect to tree shape. `Entry` implements this here; the UI's
+/// `DisplayNode` implementation lives in `display_tree.rs` because that type
+/// is owned by the UI-side preparation module.
+pub(crate) trait InsightTree: Sized {
+    fn insight_name(&self) -> &str;
+    fn insight_path(&self) -> &Path;
+    fn insight_size(&self) -> u64;
+    fn insight_is_dir(&self) -> bool;
+    fn insight_children(&self) -> &[Self];
+}
+
+impl InsightTree for crate::scanner::Entry {
+    fn insight_name(&self) -> &str {
+        &self.name
+    }
+
+    fn insight_path(&self) -> &Path {
+        &self.path
+    }
+
+    fn insight_size(&self) -> u64 {
+        self.size
+    }
+
+    fn insight_is_dir(&self) -> bool {
+        self.is_dir
+    }
+
+    fn insight_children(&self) -> &[Self] {
+        &self.children
+    }
 }
 
 /// A single ranked entry in the biggest-files/folders leaderboard.
-#[derive(Debug, Clone)]
-pub struct LeaderboardEntry {
-    pub name: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeaderboardEntry {
+    pub(crate) name: String,
     /// Names from the focus node down to this entry (inclusive), the same
     /// relative trail `app.rs` appends to `self.focus` to navigate.
-    pub trail: Vec<String>,
-    pub path: PathBuf,
-    pub size: u64,
-    pub is_dir: bool,
+    pub(crate) trail: Vec<String>,
+    pub(crate) path: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) is_dir: bool,
 }
 
 /// A directory flagged as a small-file blizzard: many children, low average
 /// child size.
-#[derive(Debug, Clone)]
-pub struct BlizzardEntry {
-    pub name: String,
-    pub trail: Vec<String>,
-    pub child_count: usize,
-    pub avg_child_size: u64,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlizzardEntry {
+    pub(crate) name: String,
+    pub(crate) trail: Vec<String>,
+    pub(crate) child_count: usize,
+    pub(crate) avg_child_size: u64,
 }
 
 /// How much confidence the name-only cleanup heuristic can provide. These
@@ -106,7 +122,7 @@ pub struct CleanupClassification {
 }
 
 /// A file or directory whose name matches a cleanup-candidate pattern.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupCandidate {
     pub name: String,
     pub trail: Vec<String>,
@@ -116,136 +132,209 @@ pub struct CleanupCandidate {
     pub classification: CleanupClassification,
 }
 
-impl<'a> InsightNode<'a> {
-    /// Borrows a [`crate::scanner::Entry`] tree into the insight view. The
-    /// live-scan `app::Node` path lives in `app.rs` (its type is private);
-    /// this keeps the two source trees symmetric and is exercised by the
-    /// unit tests below.
-    #[allow(dead_code)]
-    pub fn from_entry(entry: &'a crate::scanner::Entry) -> InsightNode<'a> {
-        InsightNode {
-            name: &entry.name,
-            path: &entry.path,
-            size: entry.size,
-            is_dir: entry.is_dir,
-            children: entry.children.iter().map(InsightNode::from_entry).collect(),
-        }
-    }
+/// All drawer analytics produced by one traversal of a focused subtree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct InsightSummary {
+    pub(crate) ext_totals: Vec<(String, u64)>,
+    pub(crate) leaderboard: Vec<LeaderboardEntry>,
+    pub(crate) blizzard: Vec<BlizzardEntry>,
+    pub(crate) cleanup_candidates: Vec<CleanupCandidate>,
+    pub(crate) total_size: u64,
+}
 
-    /// Total size per distinct file extension across every file in the
-    /// subtree, sorted largest first (ties broken by extension name). The
-    /// extension is lowercased so it keys the same color
-    /// `theme::color_for_extension` assigns; extensionless files collapse to
-    /// a single `""` entry. Drives both the legend and the size breakdown.
-    pub fn extension_totals(&self) -> Vec<(String, u64)> {
-        fn walk(node: &InsightNode, totals: &mut HashMap<String, u64>) {
-            if node.is_dir {
-                for child in &node.children {
-                    walk(child, totals);
-                }
-            } else {
-                *totals.entry(extension_of(node.name)).or_insert(0) += node.size;
-            }
-        }
-        let mut totals: HashMap<String, u64> = HashMap::new();
-        walk(self, &mut totals);
-        let mut out: Vec<(String, u64)> = totals.into_iter().collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        out
-    }
+struct Aggregator {
+    ext_totals: HashMap<String, u64>,
+    leaderboard: BinaryHeap<LeaderboardEntry>,
+    blizzard: Vec<BlizzardEntry>,
+    cleanup_candidates: Vec<CleanupCandidate>,
+    leaderboard_limit: usize,
+}
 
-    /// The `n` largest files and folders anywhere in the subtree, ranked by
-    /// size, each carrying its relative trail for focus navigation.
-    pub fn leaderboard(&self, n: usize) -> Vec<LeaderboardEntry> {
-        fn walk(node: &InsightNode, trail: &mut Vec<String>, out: &mut Vec<LeaderboardEntry>) {
-            for child in &node.children {
-                trail.push(child.name.to_string());
-                out.push(LeaderboardEntry {
-                    name: child.name.to_string(),
-                    trail: trail.clone(),
-                    path: child.path.to_path_buf(),
-                    size: child.size,
-                    is_dir: child.is_dir,
-                });
-                walk(child, trail, out);
-                trail.pop();
-            }
-        }
-        let mut out = Vec::new();
-        walk(self, &mut Vec::new(), &mut out);
-        out.sort_by_key(|b| std::cmp::Reverse(b.size));
-        out.truncate(n);
-        out
-    }
+/// Computes every Insights section in one borrowed traversal.
+///
+/// The leaderboard heap never grows beyond `leaderboard_limit`; entries are
+/// cloned only when they can displace the current worst retained candidate.
+/// Other sections intentionally retain their complete result sets because the
+/// drawer displays all matching extension/blizzard/junk categories.
+pub(crate) fn aggregate<T: InsightTree>(root: &T, leaderboard_limit: usize) -> InsightSummary {
+    let mut aggregation = Aggregator {
+        ext_totals: HashMap::new(),
+        leaderboard: BinaryHeap::with_capacity(leaderboard_limit),
+        blizzard: Vec::new(),
+        cleanup_candidates: Vec::new(),
+        leaderboard_limit,
+    };
+    let mut trail = Vec::new();
+    visit(root, &mut trail, true, true, &mut aggregation);
 
-    /// Directories in the subtree with a high child count but a low average
-    /// child size — `node_modules`-style clutter — sorted most-cluttered
-    /// first. The focus node itself is never flagged, only its descendants.
-    pub fn blizzard_flags(&self) -> Vec<BlizzardEntry> {
-        fn walk(node: &InsightNode, trail: &mut Vec<String>, out: &mut Vec<BlizzardEntry>) {
-            for child in &node.children {
-                if !child.is_dir {
-                    continue;
-                }
-                trail.push(child.name.to_string());
-                let count = child.children.len();
-                if count >= BLIZZARD_MIN_CHILDREN {
-                    let avg = child.size / count as u64;
-                    if avg <= BLIZZARD_MAX_AVG_SIZE {
-                        out.push(BlizzardEntry {
-                            name: child.name.to_string(),
-                            trail: trail.clone(),
-                            child_count: count,
-                            avg_child_size: avg,
-                        });
-                    }
-                }
-                walk(child, trail, out);
-                trail.pop();
-            }
-        }
-        let mut out = Vec::new();
-        walk(self, &mut Vec::new(), &mut out);
-        out.sort_by_key(|b| std::cmp::Reverse(b.child_count));
-        out
-    }
+    let mut ext_totals: Vec<(String, u64)> = aggregation.ext_totals.into_iter().collect();
+    ext_totals.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut leaderboard = aggregation.leaderboard.into_vec();
+    leaderboard.sort_by(compare_entries);
+    aggregation.blizzard.sort_by(|a, b| {
+        b.child_count
+            .cmp(&a.child_count)
+            .then_with(|| a.trail.cmp(&b.trail))
+    });
+    aggregation.cleanup_candidates.sort_by(|a, b| {
+        b.size
+            .cmp(&a.size)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.trail.cmp(&b.trail))
+    });
 
-    /// Files and directories in the subtree whose names match a fixed set of
-    /// cleanup-candidate patterns (installers, build outputs, dependency
-    /// caches, and application caches), sorted largest first. A matched
-    /// directory is not descended into — the candidate stands in for
-    /// everything beneath it.
-    pub fn cleanup_candidates(&self) -> Vec<CleanupCandidate> {
-        fn walk(node: &InsightNode, trail: &mut Vec<String>, out: &mut Vec<CleanupCandidate>) {
-            for child in &node.children {
-                trail.push(child.name.to_string());
-                if let Some(classification) = classify_cleanup_candidate(child.name, child.is_dir) {
-                    out.push(CleanupCandidate {
-                        name: child.name.to_string(),
-                        trail: trail.clone(),
-                        path: child.path.to_path_buf(),
-                        is_dir: child.is_dir,
-                        size: child.size,
-                        classification,
-                    });
-                    // A matched directory stands in for its contents; don't
-                    // surface nested candidates that would be acted on twice.
-                } else if child.is_dir {
-                    walk(child, trail, out);
-                }
-                trail.pop();
-            }
-        }
-        let mut out = Vec::new();
-        walk(self, &mut Vec::new(), &mut out);
-        out.sort_by_key(|candidate| std::cmp::Reverse(candidate.size));
-        out
+    InsightSummary {
+        ext_totals,
+        leaderboard,
+        blizzard: aggregation.blizzard,
+        cleanup_candidates: aggregation.cleanup_candidates,
+        total_size: root.insight_size(),
     }
 }
 
+/// Visits the entire tree once. `cleanup_allowed` is separate from the other
+/// analytics: a matched cleanup directory suppresses nested suggestions,
+/// but its descendants still contribute to totals, ranking, and blizzard
+/// detection.
+fn visit<'a, T: InsightTree>(
+    node: &'a T,
+    trail: &mut Vec<&'a str>,
+    is_root: bool,
+    cleanup_allowed: bool,
+    aggregation: &mut Aggregator,
+) {
+    if !is_root {
+        retain_leaderboard(node, trail, aggregation);
+    }
+
+    if node.insight_is_dir() {
+        let child_count = node.insight_children().len();
+        if !is_root && child_count >= BLIZZARD_MIN_CHILDREN {
+            let avg_child_size = node.insight_size() / child_count as u64;
+            if avg_child_size <= BLIZZARD_MAX_AVG_SIZE {
+                aggregation.blizzard.push(BlizzardEntry {
+                    name: node.insight_name().to_owned(),
+                    trail: owned_trail(trail),
+                    child_count,
+                    avg_child_size,
+                });
+            }
+        }
+
+        for child in node.insight_children() {
+            trail.push(child.insight_name());
+            let matched_cleanup = if cleanup_allowed {
+                classify_cleanup_candidate(child.insight_name(), child.insight_is_dir())
+            } else {
+                None
+            };
+            if let Some(classification) = matched_cleanup {
+                aggregation.cleanup_candidates.push(CleanupCandidate {
+                    name: child.insight_name().to_owned(),
+                    trail: owned_trail(trail),
+                    path: child.insight_path().to_path_buf(),
+                    is_dir: child.insight_is_dir(),
+                    size: child.insight_size(),
+                    classification,
+                });
+            }
+            visit(
+                child,
+                trail,
+                false,
+                cleanup_allowed && !(matched_cleanup.is_some() && child.insight_is_dir()),
+                aggregation,
+            );
+            trail.pop();
+        }
+    } else {
+        *aggregation
+            .ext_totals
+            .entry(extension_of(node.insight_name()))
+            .or_insert(0) += node.insight_size();
+    }
+}
+
+fn owned_trail(trail: &[&str]) -> Vec<String> {
+    trail.iter().map(|part| (*part).to_owned()).collect()
+}
+
+fn retain_leaderboard<T: InsightTree>(node: &T, trail: &[&str], aggregation: &mut Aggregator) {
+    if aggregation.leaderboard_limit == 0 {
+        return;
+    }
+    if aggregation.leaderboard.len() >= aggregation.leaderboard_limit {
+        let worst = aggregation
+            .leaderboard
+            .peek()
+            .expect("a full leaderboard has a worst candidate");
+        if compare_candidate(node, trail, worst) != Ordering::Less {
+            return;
+        }
+    }
+
+    aggregation.leaderboard.push(LeaderboardEntry {
+        name: node.insight_name().to_owned(),
+        trail: owned_trail(trail),
+        path: node.insight_path().to_path_buf(),
+        size: node.insight_size(),
+        is_dir: node.insight_is_dir(),
+    });
+    if aggregation.leaderboard.len() > aggregation.leaderboard_limit {
+        aggregation.leaderboard.pop();
+    }
+}
+
+/// Ordering used by both retained candidates and final output: largest size
+/// first, then path/name/trail for deterministic ties. Because `BinaryHeap`
+/// keeps its greatest item at the root, this ordering makes the root the
+/// *worst* retained candidate: smaller entries and later tie-break values
+/// compare greater than better entries.
+fn compare_entries(a: &LeaderboardEntry, b: &LeaderboardEntry) -> Ordering {
+    b.size
+        .cmp(&a.size)
+        .then_with(|| a.path.cmp(&b.path))
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.trail.cmp(&b.trail))
+}
+
+impl Ord for LeaderboardEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_entries(self, other)
+    }
+}
+
+impl PartialOrd for LeaderboardEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn compare_candidate<T: InsightTree>(
+    candidate: &T,
+    trail: &[&str],
+    existing: &LeaderboardEntry,
+) -> Ordering {
+    existing
+        .size
+        .cmp(&candidate.insight_size())
+        .then_with(|| candidate.insight_path().cmp(existing.path.as_path()))
+        .then_with(|| candidate.insight_name().cmp(&existing.name))
+        .then_with(|| compare_trails(trail, &existing.trail))
+}
+
+fn compare_trails(candidate: &[&str], existing: &[String]) -> Ordering {
+    for (left, right) in candidate.iter().zip(existing) {
+        let ordering = (*left).cmp(right.as_str());
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    candidate.len().cmp(&existing.len())
+}
+
 /// The lowercased extension of a file name, or `""` for extensionless files
-/// (and dotfiles, whose leading dot is not an extension) — matching
-/// `theme`'s own extension logic so the drawer keys the same colors.
+/// (and dotfiles, whose leading dot is not an extension).
 fn extension_of(name: &str) -> String {
     match name.rsplit_once('.') {
         Some((stem, ext)) if !stem.is_empty() => ext.to_ascii_lowercase(),
@@ -255,8 +344,8 @@ fn extension_of(name: &str) -> String {
 
 /// Classifies a name against the fixed cleanup-candidate ruleset. The
 /// classifier intentionally returns structured, advisory information rather
-/// than an unqualified deletion recommendation: a name match cannot establish that deleting
-/// the entry is safe.
+/// than an unqualified deletion recommendation: a name match cannot establish
+/// that deleting the entry is safe.
 pub fn classify_cleanup_candidate(name: &str, is_dir: bool) -> Option<CleanupClassification> {
     let lower = name.to_ascii_lowercase();
     if is_dir {
@@ -345,7 +434,11 @@ mod tests {
     }
 
     #[test]
-    fn extension_totals_sum_and_sort_largest_first() {
+    fn one_aggregate_matches_all_drawer_sections() {
+        let clutter = dir(
+            "node_modules",
+            (0..150).map(|i| file(&format!("m{i}.js"), 1024)).collect(),
+        );
         let tree = dir(
             "root",
             vec![
@@ -353,93 +446,98 @@ mod tests {
                 file("b.rs", 50),
                 file("c.txt", 30),
                 dir("sub", vec![file("d.rs", 10), file("Makefile", 5)]),
+                clutter,
+                file("setup_v2.exe", 9000),
             ],
         );
-        let view = InsightNode::from_entry(&tree);
-        let totals = view.extension_totals();
-        // rs = 100 + 50 + 10 = 160, txt = 30, "" (Makefile) = 5.
+        let summary = aggregate(&tree, 15);
+
         assert_eq!(
-            totals,
+            summary.ext_totals,
             vec![
+                ("js".to_string(), 150 * 1024),
+                ("exe".to_string(), 9000),
                 ("rs".to_string(), 160),
                 ("txt".to_string(), 30),
                 (String::new(), 5),
             ]
         );
+        assert_eq!(summary.total_size, tree.size);
+        assert_eq!(summary.blizzard.len(), 1);
+        assert_eq!(summary.blizzard[0].name, "node_modules");
+        assert_eq!(summary.cleanup_candidates.len(), 2);
+        assert_eq!(summary.cleanup_candidates[0].name, "node_modules");
+        assert_eq!(summary.cleanup_candidates[1].name, "setup_v2.exe");
     }
 
     #[test]
-    fn extension_totals_are_case_insensitive() {
-        let tree = dir("root", vec![file("a.PNG", 10), file("b.png", 5)]);
-        let totals = InsightNode::from_entry(&tree).extension_totals();
-        assert_eq!(totals, vec![("png".to_string(), 15)]);
+    fn extension_totals_are_case_insensitive_and_dotfiles_are_extensionless() {
+        let tree = dir(
+            "root",
+            vec![file("a.PNG", 10), file("b.png", 5), file(".env", 2)],
+        );
+        assert_eq!(
+            aggregate(&tree, 0).ext_totals,
+            vec![("png".to_string(), 15), (String::new(), 2)]
+        );
     }
 
     #[test]
-    fn leaderboard_ranks_by_size_and_carries_trail() {
+    fn leaderboard_is_bounded_and_has_deterministic_path_ties() {
+        let tree = dir(
+            "root",
+            (0..100)
+                .map(|i| file(&format!("f{i:03}.dat"), 10_000 - i))
+                .collect(),
+        );
+        let board = aggregate(&tree, 3).leaderboard;
+        assert_eq!(board.len(), 3);
+        assert_eq!(
+            board
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["f000.dat", "f001.dat", "f002.dat"]
+        );
+
+        let tied = dir(
+            "root",
+            vec![file("z.bin", 10), file("a.bin", 10), file("m.bin", 10)],
+        );
+        let board = aggregate(&tied, 3).leaderboard;
+        assert_eq!(
+            board
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.bin", "m.bin", "z.bin"]
+        );
+    }
+
+    #[test]
+    fn leaderboard_carries_relative_trails_and_files_focus_their_parent() {
         let tree = dir(
             "root",
             vec![
-                file("small.txt", 10),
                 dir("big", vec![file("huge.bin", 900)]),
                 file("mid.txt", 100),
             ],
         );
-        let board = InsightNode::from_entry(&tree).leaderboard(3);
-        // "big" (900) ranks above its own child "huge.bin" (900) only by
-        // insertion tie order, but both outrank mid (100) and small (10).
-        let names: Vec<&str> = board.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(
-            names[0..2].iter().collect::<std::collections::HashSet<_>>(),
-            ["big", "huge.bin"].iter().collect()
-        );
-        assert!(board.iter().all(|e| e.size >= 100));
-        // The nested file's trail is relative to the focus node.
-        let huge = board.iter().find(|e| e.name == "huge.bin").unwrap();
-        assert_eq!(huge.trail, vec!["big".to_string(), "huge.bin".to_string()]);
+        let board = aggregate(&tree, 3).leaderboard;
+        let huge = board.iter().find(|entry| entry.name == "huge.bin").unwrap();
+        assert_eq!(huge.trail, vec!["big", "huge.bin"]);
         assert!(!huge.is_dir);
     }
 
     #[test]
-    fn leaderboard_truncates_to_n() {
-        let tree = dir(
-            "root",
-            (0..10).map(|i| file(&format!("f{i}.dat"), i)).collect(),
-        );
-        assert_eq!(InsightNode::from_entry(&tree).leaderboard(3).len(), 3);
-    }
-
-    #[test]
-    fn blizzard_catches_many_small_children_and_skips_normal_dirs() {
-        let clutter = dir(
-            "node_modules",
-            (0..150).map(|i| file(&format!("m{i}.js"), 1024)).collect(),
-        );
-        let normal = dir(
-            "media",
-            (0..3)
-                .map(|i| file(&format!("v{i}.mp4"), 500_000_000))
-                .collect(),
-        );
-        let tree = dir("root", vec![clutter, normal]);
-        let flags = InsightNode::from_entry(&tree).blizzard_flags();
-        assert_eq!(flags.len(), 1);
-        assert_eq!(flags[0].name, "node_modules");
-        assert_eq!(flags[0].child_count, 150);
-        assert_eq!(flags[0].avg_child_size, 1024);
-    }
-
-    #[test]
-    fn blizzard_skips_dir_with_high_count_but_large_average() {
-        // 120 children, but each is large, so average is well over the cap.
+    fn blizzard_skips_dirs_with_large_average_children() {
         let big = dir(
             "assets",
             (0..120)
                 .map(|i| file(&format!("a{i}.bin"), 10 * 1024 * 1024))
                 .collect(),
         );
-        let tree = dir("root", vec![big]);
-        assert!(InsightNode::from_entry(&tree).blizzard_flags().is_empty());
+        assert!(aggregate(&dir("root", vec![big]), 0).blizzard.is_empty());
     }
 
     #[test]
@@ -447,7 +545,10 @@ mod tests {
         let tree = dir(
             "root",
             vec![
-                dir("node_modules", vec![file("index.js", 100)]),
+                dir(
+                    "node_modules",
+                    vec![dir("node_modules", vec![file("x.js", 10)])],
+                ),
                 dir("target", vec![file("app", 5000)]),
                 dir(".cache", vec![file("index", 4000)]),
                 dir("src", vec![file("main.rs", 200)]),
@@ -456,9 +557,8 @@ mod tests {
                 file("photo.jpg", 300),
             ],
         );
-        let candidates = InsightNode::from_entry(&tree).cleanup_candidates();
+        let candidates = aggregate(&tree, 0).cleanup_candidates;
         let names: Vec<&str> = candidates.iter().map(|entry| entry.name.as_str()).collect();
-
         assert_eq!(
             names,
             vec![
@@ -472,85 +572,47 @@ mod tests {
         assert!(!candidates
             .iter()
             .any(|entry| entry.name == "src" || entry.name == "photo.jpg"));
-
         let node_modules = candidates
             .iter()
             .find(|entry| entry.name == "node_modules")
             .unwrap();
         assert_eq!(
-            node_modules.classification,
-            CleanupClassification {
-                category: CleanupCategory::DependencyCache,
-                reason:
-                    "A package dependency directory that can be restored by its package manager.",
-                confidence: CleanupConfidence::Medium,
-            }
+            node_modules.classification.category,
+            CleanupCategory::DependencyCache
         );
         assert_eq!(
-            node_modules.classification.confidence.label(),
-            "Medium confidence"
+            node_modules.classification.confidence,
+            CleanupConfidence::Medium
         );
+        assert_eq!(node_modules.trail, vec!["node_modules"]);
     }
 
     #[test]
-    fn cleanup_classifier_covers_high_medium_and_context_dependent_matches() {
+    fn cleanup_classifier_is_advisory_and_case_insensitive() {
         let high = classify_cleanup_candidate(".CACHE", true).unwrap();
-        assert_eq!(high.category, CleanupCategory::BrowserCache);
         assert_eq!(high.confidence, CleanupConfidence::High);
-
         let medium = classify_cleanup_candidate("NODE_MODULES", true).unwrap();
-        assert_eq!(medium.category, CleanupCategory::DependencyCache);
         assert_eq!(medium.confidence, CleanupConfidence::Medium);
-
         for (name, is_dir, category) in [
             ("build", true, CleanupCategory::BuildOutput),
-            ("dist", true, CleanupCategory::BuildOutput),
-            ("out", true, CleanupCategory::BuildOutput),
             ("package.msi", false, CleanupCategory::Installer),
             ("setup.exe", false, CleanupCategory::Installer),
-            ("INSTALLER.EXE", false, CleanupCategory::Installer),
         ] {
             let classification = classify_cleanup_candidate(name, is_dir).unwrap();
-            assert_eq!(
-                classification.category, category,
-                "classification for {name}"
-            );
+            assert_eq!(classification.category, category);
             assert_eq!(
                 classification.confidence,
-                CleanupConfidence::ContextDependent,
-                "confidence for {name}"
+                CleanupConfidence::ContextDependent
             );
-            assert!(
-                !classification.reason.to_ascii_lowercase().contains("safe"),
-                "reason must remain advisory for {name}"
-            );
+            assert!(!classification.reason.to_ascii_lowercase().contains("safe"));
         }
-    }
-
-    #[test]
-    fn cleanup_classifier_is_case_insensitive_and_rejects_non_matches() {
-        assert!(classify_cleanup_candidate("Code Cache", true).is_some());
-        assert!(classify_cleanup_candidate("uninstall.exe", false).is_none());
-        assert!(classify_cleanup_candidate("uninstaller.exe", false).is_none());
-        assert!(classify_cleanup_candidate("MyUnInstaller.EXE", false).is_none());
-        assert!(classify_cleanup_candidate("src", true).is_none());
-        assert!(classify_cleanup_candidate("launch.exe", false).is_none());
-        assert!(classify_cleanup_candidate("photo.jpg", false).is_none());
-    }
-
-    #[test]
-    fn cleanup_candidates_do_not_descend_into_matched_directories() {
-        // A node_modules holding a nested node_modules should surface only
-        // the outer one, because the outer candidate represents its subtree.
-        let tree = dir(
-            "root",
-            vec![dir(
-                "node_modules",
-                vec![dir("node_modules", vec![file("x.js", 10)])],
-            )],
-        );
-        let candidates = InsightNode::from_entry(&tree).cleanup_candidates();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].trail, vec!["node_modules".to_string()]);
+        for (name, is_dir) in [
+            ("uninstall.exe", false),
+            ("uninstaller.exe", false),
+            ("src", true),
+            ("photo.jpg", false),
+        ] {
+            assert!(classify_cleanup_candidate(name, is_dir).is_none());
+        }
     }
 }

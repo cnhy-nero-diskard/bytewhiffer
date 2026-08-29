@@ -26,4 +26,3 @@
 
 - [x] 5.1 Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and `cargo test --release`.
 - [x] 5.2 Manually verify confirmation, recycle-bin behavior, failure messaging, focus repair, and candidate wording on Windows.
-
