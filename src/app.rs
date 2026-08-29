@@ -3683,10 +3683,11 @@ mod delete_action_tests {
             .find(&["keep.bin".into()])
             .is_some());
         assert_eq!(app.tree_rev, 0);
-        assert_eq!(
-            app.error.as_deref(),
-            Some("Could not send scan/target to the recycle bin: access denied")
+        let expected_error = format!(
+            "Could not send {} to the recycle bin: access denied",
+            target.path.display()
         );
+        assert_eq!(app.error.as_deref(), Some(expected_error.as_str()));
     }
 
     #[test]
