@@ -110,24 +110,81 @@ pub enum ScanOutcome {
     /// The engine could not produce a result.
     Failed(ScanError),
     /// The worker contained a panic raised by the engine.
+    #[allow(dead_code)]
     Panicked,
 }
 
 /// Shared, lock-free progress state a caller can poll from another thread to
 /// show "N files / X GB scanned so far" while a scan is in flight. Counters
-/// only ever increase during a scan; `complete` flips once, when the engine
-/// returns, so pollers have a final "no longer in flight" state to observe.
+/// only ever increase during a scan; `complete` flips once after the scanner
+/// and background display-tree preparation finish, so pollers have a final
+/// "no longer in flight" state to observe.
 #[derive(Default)]
 pub struct ScanProgress {
     pub files_scanned: AtomicU64,
     pub dirs_scanned: AtomicU64,
     pub bytes_scanned: AtomicU64,
+    conversion_nodes_total: AtomicU64,
+    conversion_nodes_finished: AtomicU64,
+    conversion_started: AtomicBool,
+    conversion_complete: AtomicBool,
     complete: AtomicBool,
 }
 
 impl ScanProgress {
+    pub(crate) fn start_conversion(&self, total: u64) {
+        self.conversion_nodes_total.store(total, Ordering::Relaxed);
+        self.conversion_nodes_finished.store(0, Ordering::Relaxed);
+        self.conversion_started.store(true, Ordering::Release);
+        self.conversion_complete.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn conversion_node_finished(&self) {
+        self.conversion_nodes_finished
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn finish_conversion(&self) {
+        self.conversion_complete.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn conversion_started(&self) -> bool {
+        self.conversion_started.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn conversion_complete(&self) -> bool {
+        self.conversion_complete.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn conversion_progress(&self) -> f32 {
+        if self.conversion_complete() {
+            return 1.0;
+        }
+        let total = self.conversion_nodes_total.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        let finished = self
+            .conversion_nodes_finished
+            .load(Ordering::Relaxed)
+            .min(total);
+        finished as f32 / total as f32
+    }
+
+    #[cfg(test)]
+    pub(crate) fn conversion_counts(&self) -> (u64, u64) {
+        (
+            self.conversion_nodes_total.load(Ordering::Relaxed),
+            self.conversion_nodes_finished.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn mark_incomplete(&self) {
+        self.complete.store(false, Ordering::Release);
+    }
+
     pub fn mark_complete(&self) {
-        self.complete.store(true, Ordering::Relaxed);
+        self.complete.store(true, Ordering::Release);
     }
 
     #[allow(dead_code)]

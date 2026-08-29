@@ -491,6 +491,7 @@ pub(crate) fn parse_data_runs(b: &[u8]) -> Vec<DataRun> {
 /// and returns its decoded data runs. Used to locate the `$MFT`'s own fragments
 /// from record 0. Returns an empty vec if `$DATA` is resident or absent.
 #[allow(clippy::while_let_loop)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn data_runs_of(buf: &[u8]) -> Vec<DataRun> {
     let Some(mut off) = le_u16(buf, rec::FIRST_ATTR_OFFSET).map(|v| v as usize) else {
         return Vec::new();
@@ -1073,7 +1074,7 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::*;
-    use crate::scanner::{Entry, ScanContext, ScanError, ScanOutcome};
+    use crate::scanner::{ScanContext, ScanError, ScanOutcome};
     use std::path::Path;
 
     pub fn process_is_elevated() -> bool {

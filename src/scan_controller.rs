@@ -13,13 +13,23 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::display_tree::DisplayNode;
 use crate::scanner::{
-    live_event_channel, ScanContext, ScanEngine, ScanEvent, ScanId, ScanOutcome, ScanProgress,
+    live_event_channel, ScanContext, ScanEngine, ScanError, ScanEvent, ScanId, ScanOutcome,
+    ScanProgress,
 };
+
+#[derive(Debug)]
+pub(crate) enum PreparedOutcome {
+    Success(DisplayNode),
+    Cancelled,
+    Failed(ScanError),
+    Panicked,
+}
 
 struct WorkerCompletion {
     id: ScanId,
-    outcome: ScanOutcome,
+    outcome: PreparedOutcome,
 }
 
 struct ActiveGeneration {
@@ -31,12 +41,12 @@ struct ActiveGeneration {
     handle: Option<JoinHandle<()>>,
 }
 
-/// A completed worker result tagged with the generation that produced it.
-pub struct ScanCompletion {
-    pub id: ScanId,
-    pub engine_name: &'static str,
-    pub progress: Arc<ScanProgress>,
-    pub outcome: ScanOutcome,
+/// A completed generation result tagged with the generation that produced it.
+pub(crate) struct ScanCompletion {
+    pub(crate) id: ScanId,
+    pub(crate) engine_name: &'static str,
+    pub(crate) progress: Arc<ScanProgress>,
+    pub(crate) outcome: PreparedOutcome,
 }
 
 /// Owns and joins retired worker handles away from the UI thread.
@@ -140,22 +150,41 @@ impl ScanController {
             .name(format!("bytewhiffer-scan-{id}"))
             .spawn(move || {
                 let outcome = match catch_unwind(AssertUnwindSafe(|| {
-                    engine.scan(&worker_target, &worker_ctx)
-                })) {
-                    Ok(outcome) => {
-                        // Cancellation wins a race where a fake or future
-                        // engine returns success immediately after the UI
-                        // retires the generation.
-                        if worker_ctx.cancel.load(Ordering::Acquire) {
-                            match outcome {
-                                ScanOutcome::Success(_) => ScanOutcome::Cancelled,
-                                other => other,
-                            }
-                        } else {
-                            outcome
+                    let outcome = engine.scan(&worker_target, &worker_ctx);
+                    let outcome = if worker_ctx.cancel.load(Ordering::Acquire) {
+                        match outcome {
+                            // Cancellation wins a race where a fake or future
+                            // engine returns success immediately after the UI
+                            // retires the generation.
+                            ScanOutcome::Success(_) => ScanOutcome::Cancelled,
+                            other => other,
                         }
+                    } else {
+                        outcome
+                    };
+
+                    match outcome {
+                        ScanOutcome::Success(entry) => {
+                            // Engines mark their traversal complete before
+                            // returning. Preparation is still part of this
+                            // generation, so reopen the progress window until
+                            // the display tree has been fully built.
+                            worker_ctx.progress.mark_incomplete();
+                            DisplayNode::from_owned_entry_with_progress(
+                                entry,
+                                &worker_ctx.progress,
+                                &worker_ctx.cancel,
+                            )
+                            .map(PreparedOutcome::Success)
+                            .unwrap_or(PreparedOutcome::Cancelled)
+                        }
+                        ScanOutcome::Cancelled => PreparedOutcome::Cancelled,
+                        ScanOutcome::Failed(error) => PreparedOutcome::Failed(error),
+                        ScanOutcome::Panicked => PreparedOutcome::Panicked,
                     }
-                    Err(_) => ScanOutcome::Panicked,
+                })) {
+                    Ok(outcome) => outcome,
+                    Err(_) => PreparedOutcome::Panicked,
                 };
                 progress.mark_complete();
                 let _ = completion_sender.send(WorkerCompletion { id, outcome });
@@ -174,7 +203,8 @@ impl ScanController {
     }
 
     /// Cancels the current worker. Its completion is still reaped and can be
-    /// polled as `ScanOutcome::Cancelled`; no partial tree is synthesized.
+    /// polled as `PreparedOutcome::Cancelled`; no partial display tree is
+    /// synthesized.
     pub fn cancel_current(&self) {
         if let Some(active) = &self.current {
             active.ctx.cancel.store(true, Ordering::Release);
@@ -213,7 +243,7 @@ impl ScanController {
                     if active.handle.as_ref().is_some_and(JoinHandle::is_finished) {
                         Some(WorkerCompletion {
                             id: active.id,
-                            outcome: ScanOutcome::Panicked,
+                            outcome: PreparedOutcome::Panicked,
                         })
                     } else {
                         None
@@ -444,7 +474,7 @@ mod tests {
         let id = controller.start(PathBuf::from("a"), Box::new(ReturnEngine::success("a")));
         let completion = wait_for_completion(&mut controller);
         assert_eq!(completion.id, id);
-        assert!(matches!(completion.outcome, ScanOutcome::Success(_)));
+        assert!(matches!(completion.outcome, PreparedOutcome::Success(_)));
     }
 
     #[test]
@@ -469,7 +499,7 @@ mod tests {
         let completion = wait_for_completion(&mut controller);
         assert_eq!(completion.id, new_id);
         assert_ne!(old_id, new_id);
-        assert!(matches!(completion.outcome, ScanOutcome::Success(_)));
+        assert!(matches!(completion.outcome, PreparedOutcome::Success(_)));
         for _ in 0..2_000 {
             if controller.reaped_workers() >= 1 {
                 return;
@@ -497,7 +527,7 @@ mod tests {
         }
         controller.cancel_current();
         let completion = wait_for_completion(&mut controller);
-        assert!(matches!(completion.outcome, ScanOutcome::Cancelled));
+        assert!(matches!(completion.outcome, PreparedOutcome::Cancelled));
     }
 
     #[test]
@@ -512,14 +542,14 @@ mod tests {
             }),
         );
         let first = wait_for_completion(&mut controller);
-        assert!(matches!(first.outcome, ScanOutcome::Panicked));
+        assert!(matches!(first.outcome, PreparedOutcome::Panicked));
 
         controller.start(
             PathBuf::from("after"),
             Box::new(ReturnEngine::success("after")),
         );
         let second = wait_for_completion(&mut controller);
-        assert!(matches!(second.outcome, ScanOutcome::Success(_)));
+        assert!(matches!(second.outcome, PreparedOutcome::Success(_)));
     }
 
     #[test]
