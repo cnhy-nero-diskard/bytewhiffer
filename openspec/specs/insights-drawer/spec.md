@@ -92,17 +92,21 @@ The system SHALL flag directories within the focused subtree that have a high ch
 - **WHEN** the focused subtree contains directories with few children or large average child size
 - **THEN** those directories do not appear in the blizzard-flag list
 
-### Requirement: Known-junk suggestions
-The system SHALL flag files and directories within the focused subtree whose names match common junk patterns (e.g. installers, build caches, `node_modules`, browser cache directories), and SHALL make the existing Delete/Open/Reveal actions available for a flagged entry without introducing a new action mechanism.
+### Requirement: Cleanup candidates are advisory and explained
+The system SHALL list heuristic cleanup candidates within the focused subtree under “Cleanup candidates.” Every candidate SHALL show a match reason and a confidence classification, and the UI SHALL NOT claim that a match is safe to delete.
 
-#### Scenario: A recognized junk directory is flagged
-- **WHEN** the focused subtree contains a directory whose name matches a known junk pattern
-- **THEN** that directory appears in the junk-suggestions list
+#### Scenario: High-confidence disposable cache matches
+- **WHEN** an entry matches a narrowly recognized disposable cache pattern
+- **THEN** it appears with the specific reason and a high-confidence advisory label
 
-#### Scenario: Acting on a flagged entry reuses existing actions
-- **WHEN** the user chooses to act on a junk-suggestion entry
-- **THEN** the same Delete, Open, and Reveal-in-Explorer actions available from the treemap's context menu are available for that entry
+#### Scenario: Context-dependent build output matches
+- **WHEN** an entry has a generic name such as `build`, `dist`, `out`, or an installer-like filename
+- **THEN** it appears as context-dependent with a reason that does not imply automatic safety
 
-#### Scenario: Junk suggestions are advisory, not automatic
-- **WHEN** entries are flagged as junk suggestions
-- **THEN** no file or directory is deleted or modified without the user explicitly choosing an action on that entry
+#### Scenario: Candidate reuses existing actions
+- **WHEN** the user opens actions for a cleanup candidate
+- **THEN** Open, Reveal, and confirmed Delete use the same action mechanisms as a treemap entry
+
+#### Scenario: Candidate is never modified automatically
+- **WHEN** an entry is classified or displayed as a cleanup candidate
+- **THEN** no filesystem mutation occurs without the user explicitly initiating and confirming Delete

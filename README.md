@@ -17,7 +17,7 @@ pain points: it's slow, and it looks like a 2010-era Win32 app.
 - Right-click actions — Delete / Open / Reveal in Explorer
 - Deterministic, themed block coloring by file type
 - Insights drawer — extension color legend, size breakdown, biggest
-  files/folders leaderboard, small-file-blizzard and known-junk flags
+  files/folders leaderboard, small-file-blizzard flags, and cleanup candidates
 - Abstraction slider — collapse the map to fewer, bigger top-level blocks;
   hover a collapsed block for a non-committal preview of its contents
 - Turbo mode — an opt-in NTFS `$MFT`-reading scan engine (the technique
@@ -97,7 +97,7 @@ src/
                    raw-volume/elevation/relaunch surface gated to Windows
   treemap.rs     — pure squarified-treemap layout algorithm (Bruls/Huizing/van Wijk 1999)
   theme.rs       — color palette + deterministic hash-derived color-from-extension logic
-  insights.rs    — pure, egui-free derived analytics (legend, leaderboard, blizzard/junk flags)
+  insights.rs    — pure, egui-free derived analytics (legend, leaderboard, blizzard flags, cleanup candidates)
   util.rs        — byte-size formatting
 ```
 
@@ -125,7 +125,7 @@ A toolbar slider (`0.0` detail .. `1.0` abstract) tightens the same pixel-size g
 
 ### Insights drawer
 
-A collapsible left-side panel (toolbar toggle, closed by default) presenting derived analytics over the currently focused subtree — extension color legend, size-by-extension breakdown, biggest-entries leaderboard, small-file-blizzard and known-junk flags. All of it is computed in `insights.rs` from the tree a scan already produced, with no new scanning cost; clicking a leaderboard entry focuses the treemap on that path via the existing navigation state.
+A collapsible left-side panel (toolbar toggle, closed by default) presenting derived analytics over the currently focused subtree — extension color legend, size-by-extension breakdown, biggest-entries leaderboard, small-file-blizzard flags, and advisory cleanup candidates. All of it is computed in `insights.rs` from the tree a scan already produced, with no new scanning cost; clicking a leaderboard entry focuses the treemap on that path via the existing navigation state.
 
 ### Turbo mode (NTFS `$MFT` engine)
 

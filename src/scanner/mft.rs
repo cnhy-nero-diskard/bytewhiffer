@@ -28,12 +28,13 @@
 //! size, and the record header) is small and well-specified, so it is
 //! hand-rolled below.
 
-// The `$MFT` parsing/reconstruction core is compiled-in and exercised only on
+// The `$MFT` parsing/reconstruction core is compiled-in and exercised on
 // Windows (the `platform` module consumes it) and under `cfg(test)` (the
 // synthetic-layout tests). A plain non-Windows release build links none of it,
 // so it would otherwise flag every parser function as dead. Suppress dead-code
-// *only* in that build; on Windows and test builds detection stays fully active,
-// so a genuinely-unused helper is still caught where the code actually runs.
+// at module scope only in that build. `data_runs_of` has a narrow extra
+// non-Windows allowance below because the inert platform stub cannot call it;
+// its Windows call site and the rest of the parser remain checked where used.
 #![cfg_attr(not(any(windows, test)), allow(dead_code))]
 
 use std::path::Path;
@@ -491,6 +492,7 @@ pub(crate) fn parse_data_runs(b: &[u8]) -> Vec<DataRun> {
 /// and returns its decoded data runs. Used to locate the `$MFT`'s own fragments
 /// from record 0. Returns an empty vec if `$DATA` is resident or absent.
 #[allow(clippy::while_let_loop)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn data_runs_of(buf: &[u8]) -> Vec<DataRun> {
     let Some(mut off) = le_u16(buf, rec::FIRST_ATTR_OFFSET).map(|v| v as usize) else {
         return Vec::new();
@@ -1073,7 +1075,7 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::*;
-    use crate::scanner::{Entry, ScanContext, ScanError, ScanOutcome};
+    use crate::scanner::{ScanContext, ScanError, ScanOutcome};
     use std::path::Path;
 
     pub fn process_is_elevated() -> bool {
