@@ -303,7 +303,10 @@ pub fn classify_cleanup_candidate(name: &str, is_dir: bool) -> Option<CleanupCla
                 reason: "An installer package that may still be needed for repair or reinstall.",
                 confidence: CleanupConfidence::ContextDependent,
             }),
-            "exe" if lower.contains("setup") || lower.contains("install") => {
+            "exe"
+                if !lower.contains("uninstall")
+                    && (lower.contains("setup") || lower.contains("install")) =>
+            {
                 Some(CleanupClassification {
                     category: CleanupCategory::Installer,
                     reason: "An installer-like executable whose purpose should be checked first.",
@@ -505,6 +508,7 @@ mod tests {
             ("out", true, CleanupCategory::BuildOutput),
             ("package.msi", false, CleanupCategory::Installer),
             ("setup.exe", false, CleanupCategory::Installer),
+            ("INSTALLER.EXE", false, CleanupCategory::Installer),
         ] {
             let classification = classify_cleanup_candidate(name, is_dir).unwrap();
             assert_eq!(
@@ -526,7 +530,9 @@ mod tests {
     #[test]
     fn cleanup_classifier_is_case_insensitive_and_rejects_non_matches() {
         assert!(classify_cleanup_candidate("Code Cache", true).is_some());
-        assert!(classify_cleanup_candidate("INSTALLER.EXE", false).is_some());
+        assert!(classify_cleanup_candidate("uninstall.exe", false).is_none());
+        assert!(classify_cleanup_candidate("uninstaller.exe", false).is_none());
+        assert!(classify_cleanup_candidate("MyUnInstaller.EXE", false).is_none());
         assert!(classify_cleanup_candidate("src", true).is_none());
         assert!(classify_cleanup_candidate("launch.exe", false).is_none());
         assert!(classify_cleanup_candidate("photo.jpg", false).is_none());

@@ -1335,10 +1335,7 @@ impl BytewhifferApp {
                 self.focus = focus;
             }
             if response.secondary_clicked() {
-                let mut trail = self.focus.clone();
-                trail.extend(hit.trail.iter().cloned());
-                self.context_target =
-                    Some(make_action_target(trail, hit.fs_path.clone(), hit.is_dir));
+                self.context_target = Some(action_target_from_treemap_hit(&self.focus, hit));
             }
         } else {
             // Pointer is over no block — discard any open preview.
@@ -1689,10 +1686,8 @@ impl BytewhifferApp {
                             ),
                         );
                         if resp.secondary_clicked() {
-                            let mut trail = base.clone();
-                            trail.extend(entry.trail.iter().cloned());
                             self.context_target =
-                                Some(make_action_target(trail, entry.path.clone(), entry.is_dir));
+                                Some(action_target_from_cleanup_candidate(&base, entry));
                         }
                         resp.context_menu(|ui| self.context_menu_contents(ui));
                     }
@@ -2077,6 +2072,27 @@ fn make_action_target(trail: Vec<String>, path: PathBuf, is_dir: bool) -> Action
         is_dir,
         display_name,
     }
+}
+
+/// Adapts a treemap hit into the shared action payload. Hit trails are
+/// relative to the currently focused node, while the action target trail is
+/// relative to the scan root.
+fn action_target_from_treemap_hit(base: &[String], hit: &HitRect) -> ActionTarget {
+    let mut trail = base.to_vec();
+    trail.extend(hit.trail.iter().cloned());
+    make_action_target(trail, hit.fs_path.clone(), hit.is_dir)
+}
+
+/// Adapts an Insights cleanup candidate into the shared action payload.
+/// Candidate trails are relative to the currently focused subtree, just like
+/// treemap hit trails.
+fn action_target_from_cleanup_candidate(
+    base: &[String],
+    entry: &insights::CleanupCandidate,
+) -> ActionTarget {
+    let mut trail = base.to_vec();
+    trail.extend(entry.trail.iter().cloned());
+    make_action_target(trail, entry.path.clone(), entry.is_dir)
 }
 
 /// A drawer section header.
@@ -3715,20 +3731,45 @@ mod delete_action_tests {
     }
 
     #[test]
-    fn treemap_and_insights_actions_share_exact_target_shape() {
-        let treemap_target = make_action_target(
-            vec!["folder".to_owned(), "file.bin".to_owned()],
-            PathBuf::from("scan/folder/file.bin"),
-            false,
-        );
-        let insights_target = make_action_target(
-            vec!["folder".to_owned(), "file.bin".to_owned()],
-            PathBuf::from("scan/folder/file.bin"),
-            false,
-        );
+    fn treemap_and_insights_adapters_preserve_exact_target_shape() {
+        let base = vec!["focused".to_owned()];
+        let path = PathBuf::from("scan/folder/file.bin");
+        let hit = HitRect {
+            rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0)),
+            trail: vec!["folder".to_owned(), "file.bin".to_owned()],
+            fs_path: path.clone(),
+            is_dir: false,
+            size: 42,
+            collapsed: false,
+        };
+        let candidate = insights::CleanupCandidate {
+            name: "file.bin".to_owned(),
+            trail: vec!["folder".to_owned(), "file.bin".to_owned()],
+            path: path.clone(),
+            is_dir: false,
+            size: 42,
+            classification: insights::CleanupClassification {
+                category: insights::CleanupCategory::Installer,
+                reason: "test candidate",
+                confidence: insights::CleanupConfidence::ContextDependent,
+            },
+        };
 
+        let treemap_target = action_target_from_treemap_hit(&base, &hit);
+        let insights_target = action_target_from_cleanup_candidate(&base, &candidate);
+        let expected_trail = vec![
+            "focused".to_owned(),
+            "folder".to_owned(),
+            "file.bin".to_owned(),
+        ];
+
+        for target in [&treemap_target, &insights_target] {
+            assert_eq!(target.trail, expected_trail);
+            assert_eq!(target.path, path);
+            assert!(!target.is_dir);
+            assert_eq!(target.display_name, "file.bin");
+        }
         assert_eq!(treemap_target, insights_target);
-        assert_eq!(treemap_target.display_name, "file.bin");
     }
 }
 
