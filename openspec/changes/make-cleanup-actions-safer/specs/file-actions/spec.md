@@ -19,7 +19,11 @@ The system SHALL let the user request deletion of the file or folder represented
 - **WHEN** the confirmed filesystem operation fails, such as because the file is in use or access is denied
 - **THEN** the system shows an error and the item remains in the visible tree
 
-#### Scenario: Delete confirmation is unavailable while tree state is provisional
-- **WHEN** a scan generation is active or the authoritative tree is still being assembled, including after a confirmation has been opened
-- **THEN** Delete cannot be invoked or confirmed, the UI explains that deletion is unavailable until the tree is stable, and no filesystem or visible-tree mutation occurs
+#### Scenario: Delete is unavailable while tree state is provisional
+- **WHEN** the user opens actions for an entry while a scan generation is active or the authoritative tree is still being assembled
+- **THEN** Delete cannot be invoked, the UI explains that deletion is unavailable until the tree is stable, and no filesystem or visible-tree mutation occurs
+
+#### Scenario: An open delete confirmation is cancelled when tree state becomes provisional
+- **WHEN** a scan generation starts or authoritative-tree assembly begins after a delete confirmation has been opened
+- **THEN** the confirmation is cancelled without invoking Delete, the user must initiate deletion again once the tree is stable, and no filesystem or visible-tree mutation occurs
 

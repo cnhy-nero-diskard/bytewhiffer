@@ -1376,7 +1376,7 @@ impl BytewhifferApp {
         if !delete_available {
             ui.colored_label(
                 theme::TEXT_SUBTLE,
-                "Delete is available after scanning finishes.",
+                "Delete is available after the tree is stable.",
             );
         }
         if delete_button.clicked() {
