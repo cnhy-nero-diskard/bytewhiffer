@@ -28,12 +28,13 @@
 //! size, and the record header) is small and well-specified, so it is
 //! hand-rolled below.
 
-// The `$MFT` parsing/reconstruction core is compiled-in and exercised only on
+// The `$MFT` parsing/reconstruction core is compiled-in and exercised on
 // Windows (the `platform` module consumes it) and under `cfg(test)` (the
 // synthetic-layout tests). A plain non-Windows release build links none of it,
 // so it would otherwise flag every parser function as dead. Suppress dead-code
-// *only* in that build; on Windows and test builds detection stays fully active,
-// so a genuinely-unused helper is still caught where the code actually runs.
+// at module scope only in that build. `data_runs_of` has a narrow extra
+// non-Windows allowance below because the inert platform stub cannot call it;
+// its Windows call site and the rest of the parser remain checked where used.
 #![cfg_attr(not(any(windows, test)), allow(dead_code))]
 
 use std::path::Path;

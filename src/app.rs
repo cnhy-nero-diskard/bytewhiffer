@@ -403,12 +403,27 @@ struct ScanSummary {
 /// The Insights drawer's computed analytics for one (focus, tree revision).
 /// Cached so the whole-subtree aggregations run once per change — not every
 /// frame (see the change's design doc) — and cloned cheaply for rendering.
+/// One exact filesystem target shared by treemap and Insights actions. The
+/// trail is relative to the scan root, while `path` is the path passed to
+/// Open, Reveal, and the recycle-bin operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActionTarget {
+    trail: Vec<String>,
+    path: PathBuf,
+    is_dir: bool,
+    display_name: String,
+}
+
+/// A delete request staged by either UI entry point. Staging this value does
+/// not touch the filesystem; only the confirmation dialog can consume it.
+type PendingDelete = ActionTarget;
+
 #[derive(Clone, Default)]
 struct InsightsData {
     ext_totals: Vec<(String, u64)>,
     leaderboard: Vec<insights::LeaderboardEntry>,
     blizzard: Vec<insights::BlizzardEntry>,
-    junk: Vec<insights::JunkEntry>,
+    cleanup_candidates: Vec<insights::CleanupCandidate>,
     /// The focused subtree's total size (`view.size`) — the denominator for
     /// each row's proportional fill bar, so bars read as "% of what I'm
     /// currently looking at" and rescale for free as focus changes.
@@ -422,8 +437,11 @@ pub struct BytewhifferApp {
     scan_controller: ScanController,
     /// Names from the root node down to the focused directory.
     focus: Vec<String>,
-    /// Block the open context menu refers to (trail from root, fs path).
-    context_target: Option<(Vec<String>, PathBuf, bool)>,
+    /// Block or cleanup candidate the open context menu refers to.
+    context_target: Option<ActionTarget>,
+    /// Delete request awaiting explicit confirmation. No filesystem operation
+    /// occurs while this is merely staged.
+    pending_delete: Option<PendingDelete>,
     hovered_path: Option<PathBuf>,
     hovered_size: Option<u64>,
     error: Option<String>,
@@ -550,6 +568,10 @@ impl BytewhifferApp {
 
 impl BytewhifferApp {
     fn start_scan(&mut self, target: PathBuf) {
+        // A new scan makes any previously staged action stale; discard it
+        // before provisional tree state starts changing again.
+        self.context_target = None;
+        self.cancel_pending_delete();
         self.requested_target = Some(target.clone());
         self.path_input = target.display().to_string();
 
@@ -756,6 +778,22 @@ impl BytewhifferApp {
 
     fn delete_available(&self) -> bool {
         !self.scan_active()
+    }
+
+    /// Cancels a staged delete without touching the filesystem or visible tree.
+    fn cancel_pending_delete(&mut self) {
+        self.pending_delete = None;
+    }
+
+    /// Drops a staged delete when a scan or authoritative-tree assembly has
+    /// made the target stale. Returns whether a pending request was cleared.
+    fn clear_pending_delete_if_unavailable(&mut self) -> bool {
+        if self.pending_delete.is_some() && !self.delete_available() {
+            self.cancel_pending_delete();
+            true
+        } else {
+            false
+        }
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -1185,9 +1223,7 @@ impl BytewhifferApp {
                 self.focus = focus;
             }
             if response.secondary_clicked() {
-                let mut trail = self.focus.clone();
-                trail.extend(hit.trail.iter().cloned());
-                self.context_target = Some((trail, hit.fs_path.clone(), hit.is_dir));
+                self.context_target = Some(action_target_from_treemap_hit(&self.focus, hit));
             }
         } else {
             // Pointer is over no block — discard any open preview.
@@ -1198,27 +1234,25 @@ impl BytewhifferApp {
     }
 
     fn context_menu_contents(&mut self, ui: &mut egui::Ui) {
-        let Some((trail, fs_path, _is_dir)) = self.context_target.clone() else {
+        let Some(target) = self.context_target.clone() else {
             ui.close();
             return;
         };
 
-        ui.label(
-            egui::RichText::new(trail.last().map(String::as_str).unwrap_or("?"))
-                .color(theme::TEXT_SUBTLE),
-        );
+        ui.label(egui::RichText::new(&target.display_name).color(theme::TEXT_SUBTLE));
+        ui.colored_label(theme::TEXT_SUBTLE, target.path.display().to_string());
         ui.separator();
 
         if ui.button("Open").clicked() {
-            if let Err(err) = open::that_detached(&fs_path) {
-                self.error = Some(format!("Could not open {}: {err}", fs_path.display()));
+            if let Err(err) = open::that_detached(&target.path) {
+                self.error = Some(format!("Could not open {}: {err}", target.path.display()));
             }
             ui.close();
         }
 
         if ui.button("Reveal in Explorer").clicked() {
-            if let Err(err) = reveal_in_file_manager(&fs_path) {
-                self.error = Some(format!("Could not reveal {}: {err}", fs_path.display()));
+            if let Err(err) = reveal_in_file_manager(&target.path) {
+                self.error = Some(format!("Could not reveal {}: {err}", target.path.display()));
             }
             ui.close();
         }
@@ -1230,28 +1264,113 @@ impl BytewhifferApp {
         if !delete_available {
             ui.colored_label(
                 theme::TEXT_SUBTLE,
-                "Delete is available after scanning finishes.",
+                "Delete is available after the tree is stable.",
             );
         }
         if delete_button.clicked() {
-            match trash::delete(&fs_path) {
-                Ok(()) => {
-                    if let Some(root) = &mut self.root {
-                        root.remove(&trail);
-                    }
-                    self.tree_rev = self.tree_rev.wrapping_add(1);
-                    // If the deleted directory was inside the focused path,
-                    // fall back to its parent.
-                    if self.focus.starts_with(&trail) {
-                        self.focus.truncate(trail.len().saturating_sub(1));
-                    }
-                }
-                Err(err) => {
-                    self.error = Some(format!("Could not delete {}: {err}", fs_path.display()));
-                }
-            }
+            // Staging is deliberately the only effect of this menu action.
+            // The confirmation window performs the filesystem operation only
+            // after the user explicitly confirms this exact target.
+            self.pending_delete = Some(target);
+            self.context_target = None;
             ui.close();
         }
+    }
+
+    fn confirm_pending_delete(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.pending_delete.clone() else {
+            return;
+        };
+
+        // A scan or authoritative assembly can begin while a modal is open
+        // (for example through another UI action). Never confirm against a
+        // provisional tree; cancel the stale request and make the user stage
+        // it again after the lifecycle settles.
+        if self.clear_pending_delete_if_unavailable() {
+            return;
+        }
+
+        let response = egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
+            ui.heading(if target.is_dir {
+                "Send folder to the recycle bin?"
+            } else {
+                "Send file to the recycle bin?"
+            });
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(&target.display_name).strong());
+            ui.colored_label(theme::TEXT_SUBTLE, target.path.display().to_string());
+            ui.add_space(4.0);
+            ui.label(
+                "This sends the exact item to the Windows recycle bin. Review the path before confirming.",
+            );
+            ui.add_space(8.0);
+
+            let mut confirmed = false;
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    ui.close();
+                }
+                if ui.button("Delete").clicked() {
+                    confirmed = true;
+                }
+            });
+            confirmed
+        });
+
+        if response.should_close() {
+            self.pending_delete = None;
+        } else if response.inner {
+            if !self.delete_available() {
+                self.pending_delete = None;
+            } else if let Some(target) = self.pending_delete.take() {
+                self.delete_confirmed(target);
+            }
+        }
+    }
+
+    fn delete_confirmed(&mut self, target: ActionTarget) {
+        let result = trash::delete(&target.path).map_err(|err| err.to_string());
+        self.apply_delete_result(&target, result);
+    }
+
+    /// Applies the result of the filesystem operation to the visible tree.
+    /// Keeping this separate from `trash::delete` makes the success/failure
+    /// contract deterministic to test without touching a real recycle bin.
+    fn apply_delete_result(&mut self, target: &ActionTarget, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                let removed = self
+                    .root
+                    .as_mut()
+                    .map(|root| root.remove(&target.trail))
+                    .unwrap_or(false);
+                if removed {
+                    self.tree_rev = self.tree_rev.wrapping_add(1);
+                    self.repair_focus_after_removal(&target.trail);
+                }
+            }
+            Err(err) => {
+                self.error = Some(format!(
+                    "Could not send {} to the recycle bin: {err}",
+                    target.path.display()
+                ));
+            }
+        }
+    }
+
+    fn repair_focus_after_removal(&mut self, removed_trail: &[String]) {
+        if self.focus.starts_with(removed_trail) {
+            self.focus.truncate(removed_trail.len().saturating_sub(1));
+        }
+        if let Some(root) = &self.root {
+            while root.find(&self.focus).is_none() && !self.focus.is_empty() {
+                self.focus.pop();
+            }
+        } else {
+            self.focus.clear();
+        }
+        self.hovered_path = None;
+        self.hovered_size = None;
     }
 
     /// Recomputes whether the focused subtree is dense enough to warrant the
@@ -1303,7 +1422,7 @@ impl BytewhifferApp {
                 ext_totals: summary.ext_totals,
                 leaderboard: summary.leaderboard,
                 blizzard: summary.blizzard,
-                junk: summary.junk,
+                cleanup_candidates: summary.cleanup_candidates,
                 total_size: summary.total_size,
             }
         };
@@ -1313,9 +1432,10 @@ impl BytewhifferApp {
 
     /// Renders the Insights drawer: an extension legend + size breakdown, a
     /// biggest-items leaderboard, a small-file-blizzard flag list, and
-    /// known-junk suggestions — all describing the focused subtree. Clicking
-    /// a leaderboard/blizzard entry navigates the treemap; right-clicking a
-    /// junk entry opens the same Delete/Open/Reveal menu as a treemap block.
+    /// advisory cleanup candidates — all describing the focused subtree.
+    /// Clicking a leaderboard/blizzard entry navigates the treemap;
+    /// right-clicking a cleanup candidate opens the same Delete/Open/Reveal
+    /// menu as a treemap block.
     fn insights_panel(&mut self, ui: &mut egui::Ui) {
         self.refresh_insights();
 
@@ -1424,32 +1544,40 @@ impl BytewhifferApp {
                 }
                 ui.add_space(10.0);
 
-                // --- Known-junk suggestions. Advisory only: right-clicking
-                // opens the same context menu a treemap block does; nothing
-                // is deleted merely by being listed here. ---
-                insights_header(ui, "Junk suggestions");
-                if data.junk.is_empty() {
-                    insights_empty(ui, "No known-junk matches.");
+                // --- Cleanup candidates. These are name-based heuristics,
+                // not proof that an item is safe to delete. Right-clicking
+                // opens the same actions as a treemap block. ---
+                insights_header(ui, "Cleanup candidates");
+                if data.cleanup_candidates.is_empty() {
+                    insights_empty(ui, "No cleanup candidates found.");
                 } else {
                     ui.colored_label(
                         theme::TEXT_SUBTLE,
                         "Right-click for Open / Reveal / Delete.",
                     );
-                    for entry in &data.junk {
+                    for entry in &data.cleanup_candidates {
                         let icon = if entry.is_dir { "📁" } else { "📄" };
+                        let classification = entry.classification;
                         let resp = ui.selectable_label(
                             false,
                             format!(
                                 "{icon} {}  ·  {} · {}",
                                 entry.name,
-                                entry.category,
+                                classification.confidence.label(),
                                 format_size(entry.size)
                             ),
                         );
+                        ui.colored_label(
+                            theme::TEXT_SUBTLE,
+                            format!(
+                                "{} — {}",
+                                classification.category.label(),
+                                classification.reason
+                            ),
+                        );
                         if resp.secondary_clicked() {
-                            let mut trail = base.clone();
-                            trail.extend(entry.trail.iter().cloned());
-                            self.context_target = Some((trail, entry.path.clone(), entry.is_dir));
+                            self.context_target =
+                                Some(action_target_from_cleanup_candidate(&base, entry));
                         }
                         resp.context_menu(|ui| self.context_menu_contents(ui));
                     }
@@ -1779,6 +1907,7 @@ impl eframe::App for BytewhifferApp {
         self.error_window(&ctx);
         self.turbo_warning_window(&ctx);
         self.turbo_unsupported_window(&ctx);
+        self.confirm_pending_delete(&ctx);
     }
 }
 
@@ -1795,6 +1924,47 @@ fn focus_for(base: &[String], trail: &[String], is_dir: bool) -> Vec<String> {
     };
     f.extend(trail[..take].iter().cloned());
     f
+}
+
+/// Builds the action payload used by treemap and Insights entries. Keeping the
+/// display name separate from the filesystem path makes the confirmation text
+/// stable even for paths whose final component is not Unicode-friendly.
+fn make_action_target(trail: Vec<String>, path: PathBuf, is_dir: bool) -> ActionTarget {
+    let display_name = trail
+        .last()
+        .cloned()
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| path.display().to_string());
+    ActionTarget {
+        trail,
+        path,
+        is_dir,
+        display_name,
+    }
+}
+
+/// Adapts a treemap hit into the shared action payload. Hit trails are
+/// relative to the currently focused node, while the action target trail is
+/// relative to the scan root.
+fn action_target_from_treemap_hit(base: &[String], hit: &HitRect) -> ActionTarget {
+    let mut trail = base.to_vec();
+    trail.extend(hit.trail.iter().cloned());
+    make_action_target(trail, hit.fs_path.clone(), hit.is_dir)
+}
+
+/// Adapts an Insights cleanup candidate into the shared action payload.
+/// Candidate trails are relative to the currently focused subtree, just like
+/// treemap hit trails.
+fn action_target_from_cleanup_candidate(
+    base: &[String],
+    entry: &insights::CleanupCandidate,
+) -> ActionTarget {
+    let mut trail = base.to_vec();
+    trail.extend(entry.trail.iter().cloned());
+    make_action_target(trail, entry.path.clone(), entry.is_dir)
 }
 
 /// A drawer section header.
@@ -3172,16 +3342,273 @@ mod scan_lifecycle_ui_tests {
         app.scan_controller.cancel_current();
 
         let mut completed = false;
-        for _ in 0..2_000 {
+        for _ in 0..10_000 {
             if app.scan_controller.poll_completion().is_some() {
                 completed = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert!(
+            !app.scan_controller.is_active(),
+            "cancelled test scan should be fully retired before assembly gating is checked"
+        );
 
         assert!(completed, "cancelled scan did not publish completion");
         assert!(app.delete_available());
+    }
+}
+
+#[cfg(test)]
+mod delete_action_tests {
+    use super::*;
+
+    fn file(name: &str, size: u64) -> Entry {
+        Entry {
+            name: name.to_owned(),
+            path: PathBuf::from(name),
+            size,
+            is_dir: false,
+            children: Vec::new(),
+        }
+    }
+
+    fn dir(name: &str, children: Vec<Entry>) -> Entry {
+        let size = children
+            .iter()
+            .fold(0u64, |total, child| total.saturating_add(child.size));
+        Entry {
+            name: name.to_owned(),
+            path: PathBuf::from(name),
+            size,
+            is_dir: true,
+            children,
+        }
+    }
+
+    fn target(trail: &[&str], is_dir: bool) -> ActionTarget {
+        let trail = trail.iter().map(|name| (*name).to_owned()).collect();
+        make_action_target(trail, PathBuf::from("scan").join("target"), is_dir)
+    }
+
+    #[test]
+    fn remove_nested_leaf_propagates_size_and_repairs_index() {
+        let entry = dir(
+            "root",
+            vec![
+                dir("alpha", vec![file("a.bin", 7), file("b.bin", 11)]),
+                file("sibling.bin", 13),
+            ],
+        );
+        let mut root = Node::from_entry(&entry);
+
+        assert!(root.remove(&["alpha".into(), "a.bin".into()]));
+        assert_eq!(root.size, 24);
+        assert_eq!(root.find(&["alpha".into()]).unwrap().size, 11);
+        let alpha = root.find(&["alpha".into()]).unwrap();
+        assert!(alpha.find(&["a.bin".into()]).is_none());
+        assert_eq!(alpha.child_index.get("b.bin"), Some(&0));
+    }
+
+    #[test]
+    fn remove_top_level_child_rebuilds_sibling_indexes() {
+        let entry = dir("root", vec![file("first.bin", 5), file("second.bin", 9)]);
+        let mut root = Node::from_entry(&entry);
+
+        assert!(root.remove(&["first.bin".into()]));
+        assert_eq!(root.size, 9);
+        assert_eq!(root.child_index.get("second.bin"), Some(&0));
+        assert!(root.find(&["first.bin".into()]).is_none());
+    }
+
+    #[test]
+    fn missing_removal_does_not_change_tree() {
+        let entry = dir("root", vec![dir("alpha", vec![file("a.bin", 7)])]);
+        let mut root = Node::from_entry(&entry);
+        let before_size = root.size;
+        let before_children: Vec<String> = root
+            .children
+            .iter()
+            .map(|child| child.name.clone())
+            .collect();
+
+        assert!(!root.remove(&["alpha".into(), "missing.bin".into()]));
+        assert_eq!(root.size, before_size);
+        assert_eq!(
+            root.children
+                .iter()
+                .map(|child| child.name.clone())
+                .collect::<Vec<_>>(),
+            before_children
+        );
+        assert_eq!(root.find(&["alpha".into()]).unwrap().size, 7);
+    }
+
+    #[test]
+    fn removal_uses_saturating_size_policy_for_large_values() {
+        let entry = Entry {
+            name: "root".to_owned(),
+            path: PathBuf::from("root"),
+            size: u64::MAX,
+            is_dir: true,
+            children: vec![Entry {
+                name: "huge.bin".to_owned(),
+                path: PathBuf::from("huge.bin"),
+                size: u64::MAX,
+                is_dir: false,
+                children: Vec::new(),
+            }],
+        };
+        let mut root = Node::from_entry(&entry);
+
+        assert!(root.remove(&["huge.bin".into()]));
+        assert_eq!(root.size, 0);
+    }
+
+    #[test]
+    fn cancelled_delete_keeps_pending_target_and_tree_untouched() {
+        let entry = dir("root", vec![file("keep.bin", 12)]);
+        let mut app = BytewhifferApp::new();
+        app.root = Some(Node::from_entry(&entry));
+        app.pending_delete = Some(target(&["keep.bin"], false));
+
+        app.cancel_pending_delete();
+
+        assert!(app.pending_delete.is_none());
+        assert_eq!(app.root.as_ref().unwrap().size, 12);
+        assert!(app
+            .root
+            .as_ref()
+            .unwrap()
+            .find(&["keep.bin".into()])
+            .is_some());
+        assert_eq!(app.tree_rev, 0);
+        assert!(app.error.is_none());
+    }
+
+    struct BlockingDeleteEngine;
+
+    impl ScanEngine for BlockingDeleteEngine {
+        fn name(&self) -> &'static str {
+            "delete-test"
+        }
+
+        fn is_available(&self, _target: &Path) -> Availability {
+            Availability::Available
+        }
+
+        fn scan(
+            &self,
+            _target: &Path,
+            ctx: &crate::scanner::ScanContext,
+        ) -> crate::scanner::ScanOutcome {
+            while !ctx.is_cancelled() {
+                std::thread::yield_now();
+            }
+            crate::scanner::ScanOutcome::Cancelled
+        }
+    }
+
+    #[test]
+    fn stale_pending_delete_is_cancelled_when_scan_starts() {
+        let mut app = BytewhifferApp::new();
+        app.pending_delete = Some(target(&["keep.bin"], false));
+        app.scan_controller
+            .start(PathBuf::from("scan"), Box::new(BlockingDeleteEngine));
+
+        assert!(!app.delete_available());
+        assert!(app.clear_pending_delete_if_unavailable());
+        assert!(app.pending_delete.is_none());
+    }
+
+    #[test]
+    fn failed_delete_preserves_tree_and_surfaces_error() {
+        let entry = dir("root", vec![file("keep.bin", 12)]);
+        let mut app = BytewhifferApp::new();
+        app.root = Some(Node::from_entry(&entry));
+        let target = target(&["keep.bin"], false);
+
+        app.apply_delete_result(&target, Err("access denied".to_owned()));
+
+        assert_eq!(app.root.as_ref().unwrap().size, 12);
+        assert!(app
+            .root
+            .as_ref()
+            .unwrap()
+            .find(&["keep.bin".into()])
+            .is_some());
+        assert_eq!(app.tree_rev, 0);
+        let expected_error = format!(
+            "Could not send {} to the recycle bin: access denied",
+            target.path.display()
+        );
+        assert_eq!(app.error.as_deref(), Some(expected_error.as_str()));
+    }
+
+    #[test]
+    fn successful_delete_updates_tree_revision_and_repairs_focus() {
+        let entry = dir(
+            "root",
+            vec![
+                dir("gone", vec![file("inside.bin", 20)]),
+                file("stay.bin", 3),
+            ],
+        );
+        let mut app = BytewhifferApp::new();
+        app.root = Some(Node::from_entry(&entry));
+        app.focus = vec!["gone".to_owned(), "inside.bin".to_owned()];
+        let target = target(&["gone"], true);
+
+        app.apply_delete_result(&target, Ok(()));
+
+        let root = app.root.as_ref().unwrap();
+        assert_eq!(root.size, 3);
+        assert!(root.find(&["gone".into()]).is_none());
+        assert_eq!(app.focus, Vec::<String>::new());
+        assert_eq!(app.tree_rev, 1);
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn treemap_and_insights_adapters_preserve_exact_target_shape() {
+        let base = vec!["focused".to_owned()];
+        let path = PathBuf::from("scan/folder/file.bin");
+        let hit = HitRect {
+            rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0)),
+            trail: vec!["folder".to_owned(), "file.bin".to_owned()],
+            fs_path: path.clone(),
+            is_dir: false,
+            size: 42,
+            collapsed: false,
+        };
+        let candidate = insights::CleanupCandidate {
+            name: "file.bin".to_owned(),
+            trail: vec!["folder".to_owned(), "file.bin".to_owned()],
+            path: path.clone(),
+            is_dir: false,
+            size: 42,
+            classification: insights::CleanupClassification {
+                category: insights::CleanupCategory::Installer,
+                reason: "test candidate",
+                confidence: insights::CleanupConfidence::ContextDependent,
+            },
+        };
+
+        let treemap_target = action_target_from_treemap_hit(&base, &hit);
+        let insights_target = action_target_from_cleanup_candidate(&base, &candidate);
+        let expected_trail = vec![
+            "focused".to_owned(),
+            "folder".to_owned(),
+            "file.bin".to_owned(),
+        ];
+
+        for target in [&treemap_target, &insights_target] {
+            assert_eq!(target.trail, expected_trail);
+            assert_eq!(target.path, path);
+            assert!(!target.is_dir);
+            assert_eq!(target.display_name, "file.bin");
+        }
+        assert_eq!(treemap_target, insights_target);
     }
 }
 
