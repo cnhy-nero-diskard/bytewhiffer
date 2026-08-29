@@ -1,6 +1,6 @@
 ## Context
 
-The current fixed name matcher groups broad terms such as `build`, `dist`, and installers under “Junk suggestions.” Right-click Delete immediately calls the recycle-bin API and then mutates ancestor sizes through raw pointers. The scan-lifecycle proposal separately prevents deletion while a scan or assembly can overwrite the tree.
+The current fixed name matcher groups broad terms such as `build`, `dist`, and installers under a broad cleanup label. Right-click Delete immediately calls the recycle-bin API and then mutates ancestor sizes through raw pointers. The scan-lifecycle proposal separately prevents deletion while a scan or assembly can overwrite the tree.
 
 ## Goals / Non-Goals
 
@@ -36,7 +36,7 @@ The current fixed name matcher groups broad terms such as `build`, `dist`, and i
 
 ## Migration Plan
 
-Add structured classification and new labels, introduce the shared confirmation state, then replace `Node::remove` after regression tests capture existing successful/failed behavior. Remove old “junk” terminology once specs/UI/tests use “Cleanup candidates.” No persisted migration.
+Add structured classification and new labels, introduce the shared confirmation state, then replace `Node::remove` after regression tests capture existing successful/failed behavior. Remove the old broad heuristic terminology once specs/UI/tests use “Cleanup candidates.” No persisted migration.
 
 ## Open Questions
 

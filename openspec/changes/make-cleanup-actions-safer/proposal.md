@@ -1,10 +1,10 @@
 ## Why
 
-The Insights drawer labels broad heuristics as “junk,” and Delete is immediate despite being fed by advisory matches. Cleanup guidance should explain uncertainty and require deliberate confirmation, while tree mutation should not rely on application-level `unsafe` bookkeeping.
+The Insights drawer labels broad heuristics as disposable, and Delete is immediate despite being fed by advisory matches. Cleanup guidance should explain uncertainty and require deliberate confirmation, while tree mutation should not rely on application-level `unsafe` bookkeeping.
 
 ## What Changes
 
-- Rename “Junk suggestions” to “Cleanup candidates.”
+- Rename the broad heuristic section to “Cleanup candidates.”
 - Show the match reason and a confidence/context classification for every candidate.
 - Distinguish high-confidence caches from context-dependent build outputs and installers without claiming any candidate is safe to delete.
 - Require an explicit confirmation step before sending any file or directory to the recycle bin from either treemap or Insights actions.
@@ -19,7 +19,7 @@ The Insights drawer labels broad heuristics as “junk,” and Delete is immedia
 
 ### Modified Capabilities
 
-- `insights-drawer`: Present advisory cleanup candidates with reasons and confidence instead of labeling heuristic matches as junk.
+- `insights-drawer`: Present advisory cleanup candidates with reasons and confidence rather than using an unqualified disposable-item label.
 - `file-actions`: Require delete confirmation and safe, consistent visible-tree updates after successful deletion.
 
 ## Impact

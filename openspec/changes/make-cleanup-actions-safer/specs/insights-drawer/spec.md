@@ -1,7 +1,7 @@
 ## REMOVED Requirements
 
-### Requirement: Known-junk suggestions
-**Reason**: The “junk” label overstates heuristic certainty and does not explain why broad names such as `build`, `dist`, or installers matched.
+### Requirement: Broad disposable-item suggestions
+**Reason**: A broad disposable-item label overstates heuristic certainty and does not explain why names such as `build`, `dist`, or installers matched.
 
 **Migration**: Replace this section and terminology with the structured Cleanup candidates requirement below; existing Open/Reveal/Delete entry points remain available subject to delete confirmation.
 
