@@ -261,12 +261,15 @@ mod tests {
     }
 
     #[test]
-    fn progress_marked_complete_when_scan_returns() {
+    fn scan_phase_progress_marked_complete_when_scan_returns() {
         let dir = make_fixture();
         let ctx = ScanContext::new();
         assert!(!ctx.progress.is_complete());
         let _tree = success(WalkerEngine.scan(dir.path(), &ctx));
-        assert!(ctx.progress.is_complete());
+        assert!(ctx.progress.is_scan_complete());
+        // Only the controller can publish generation completion after display
+        // tree preparation, so a direct engine call must not claim that state.
+        assert!(!ctx.progress.is_complete());
     }
 
     #[test]
@@ -283,7 +286,8 @@ mod tests {
 
         // With cancel already set, scan_dir should not even read the top
         // directory's entries.
-        assert!(ctx.progress.is_complete());
+        assert!(ctx.progress.is_scan_complete());
+        assert!(!ctx.progress.is_complete());
     }
 
     #[test]
@@ -306,7 +310,8 @@ mod tests {
             ScanOutcome::Failed(ScanError::RootUnreadable(_))
         ));
         // Even a failed scan must leave progress in a final state.
-        assert!(ctx.progress.is_complete());
+        assert!(ctx.progress.is_scan_complete());
+        assert!(!ctx.progress.is_complete());
     }
 
     #[cfg(unix)]

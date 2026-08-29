@@ -166,10 +166,8 @@ impl ScanController {
                     match outcome {
                         ScanOutcome::Success(entry) => {
                             // Engines mark their traversal complete before
-                            // returning. Preparation is still part of this
-                            // generation, so reopen the progress window until
-                            // the display tree has been fully built.
-                            worker_ctx.progress.mark_incomplete();
+                            // returning. The generation-level completion flag
+                            // remains false while the display tree is built.
                             DisplayNode::from_owned_entry_with_progress(
                                 entry,
                                 &worker_ctx.progress,
@@ -186,7 +184,10 @@ impl ScanController {
                     Ok(outcome) => outcome,
                     Err(_) => PreparedOutcome::Panicked,
                 };
-                progress.mark_complete();
+                // This is the one and only publication of generation
+                // completion. It follows conversion for success and is the
+                // terminal state for cancellation, failure, or panic.
+                progress.mark_generation_complete();
                 let _ = completion_sender.send(WorkerCompletion { id, outcome });
             })
             .expect("scan worker thread must start");
@@ -425,6 +426,31 @@ mod tests {
         release: Arc<AtomicBool>,
     }
 
+    struct PreparationBlockingEngine {
+        started: Arc<AtomicBool>,
+        allow_return: Arc<AtomicBool>,
+    }
+
+    impl ScanEngine for PreparationBlockingEngine {
+        fn name(&self) -> &'static str {
+            "preparation-blocking-fake"
+        }
+
+        fn is_available(&self, _target: &Path) -> Availability {
+            Availability::Available
+        }
+
+        fn scan(&self, _target: &Path, ctx: &ScanContext) -> ScanOutcome {
+            ctx.progress.pause_conversion();
+            self.started.store(true, Ordering::Release);
+            while !self.allow_return.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            ctx.progress.mark_complete();
+            ScanOutcome::Success(tree("prepared"))
+        }
+    }
+
     impl ScanEngine for EventBlockingEngine {
         fn name(&self) -> &'static str {
             "event-blocking-fake"
@@ -475,6 +501,44 @@ mod tests {
         let completion = wait_for_completion(&mut controller);
         assert_eq!(completion.id, id);
         assert!(matches!(completion.outcome, PreparedOutcome::Success(_)));
+    }
+
+    #[test]
+    fn generation_completion_stays_false_until_preparation_finishes() {
+        let mut controller = ScanController::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let allow_return = Arc::new(AtomicBool::new(false));
+        let id = controller.start(
+            PathBuf::from("a"),
+            Box::new(PreparationBlockingEngine {
+                started: started.clone(),
+                allow_return: allow_return.clone(),
+            }),
+        );
+        let progress = controller.current_progress().expect("active progress");
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        allow_return.store(true, Ordering::Release);
+
+        // The scan has returned, but conversion is deliberately held. The
+        // generation flag must not be published during that interval.
+        for _ in 0..2_000 {
+            assert!(!progress.is_complete());
+            if progress.is_scan_complete() {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(progress.is_scan_complete());
+        assert!(!progress.is_complete());
+        assert!(controller.poll_completion().is_none());
+
+        progress.resume_conversion();
+        let completion = wait_for_completion(&mut controller);
+        assert_eq!(completion.id, id);
+        assert!(matches!(completion.outcome, PreparedOutcome::Success(_)));
+        assert!(completion.progress.is_complete());
     }
 
     #[test]

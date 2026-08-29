@@ -400,7 +400,7 @@ struct ScanSummary {
     elapsed: Duration,
 }
 
-/// The Insights drawer's computed analytics for one (focus, tree revision).
+/// The Insights drawer's computed analytics for one focused structural revision.
 /// Cached so the whole-subtree aggregations run once per change — not every
 /// frame (see the change's design doc) — and cloned cheaply for rendering.
 /// One exact filesystem target shared by treemap and Insights actions. The
@@ -412,6 +412,13 @@ struct ActionTarget {
     path: PathBuf,
     is_dir: bool,
     display_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InsightsKey {
+    focus: Vec<String>,
+    tree_identity: u64,
+    focused_structural_rev: u64,
 }
 
 /// A delete request staged by either UI entry point. Staging this value does
@@ -480,12 +487,20 @@ pub struct BytewhifferApp {
     /// the treemap stays full-width until the user summons it.
     insights_open: bool,
     /// Bumped whenever `root` changes (scan start, live discovery, scan
-    /// completion, deletion) so the drawer can tell its cache is stale.
+    /// completion, deletion) so layout and density caches can tell their state
+    /// is stale. Insights uses the focused node's structural revision instead
+    /// of this global revision.
     tree_rev: u64,
-    /// Cached drawer analytics plus the (focus, tree_rev) they describe;
-    /// recomputed only when that key changes.
+    /// Monotonic identity for the currently installed root generation. A fresh
+    /// authoritative tree can start its node revisions at the same values as
+    /// the previous tree, so Insights must include this identity in its key.
+    tree_identity: u64,
+    /// Cached drawer analytics plus the focus, root identity, and focused-node
+    /// structural revision they describe; recomputed only when that key changes.
     insights_cache: Option<InsightsData>,
-    insights_key: Option<(Vec<String>, u64)>,
+    insights_key: Option<InsightsKey>,
+    #[cfg(test)]
+    insights_refreshes: usize,
     /// Cached "is the focused subtree dense enough for the cheap render tier?"
     /// decision, plus the (focus, tree_rev) it describes — recomputed only when
     /// that key changes, exactly like `insights_cache`. Keeps the descendant
@@ -617,7 +632,7 @@ impl BytewhifferApp {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| target.to_string_lossy().into_owned());
-        self.root = Some(Node::new(root_name, target.clone(), 0, true));
+        self.replace_root(Some(Node::new(root_name, target.clone(), 0, true)));
         self.focus.clear();
         self.hovered_path = None;
         self.hovered_size = None;
@@ -719,7 +734,7 @@ impl BytewhifferApp {
                 // The controller prepares the complete display tree before
                 // publishing this message. Install it atomically so the
                 // provisional live tree is never replaced by a partial one.
-                self.root = Some(root);
+                self.replace_root(Some(root));
                 if let Some(root) = &self.root {
                     if root.find(&self.focus).is_none() {
                         self.focus.clear();
@@ -734,7 +749,7 @@ impl BytewhifferApp {
                 self.tree_rev = self.tree_rev.wrapping_add(1);
             }
             PreparedOutcome::Cancelled => {
-                self.root = None;
+                self.replace_root(None);
                 self.focus.clear();
                 self.tree_rev = self.tree_rev.wrapping_add(1);
             }
@@ -745,7 +760,7 @@ impl BytewhifferApp {
                     }
                     ScanError::RootUnreadable(e) => format!("Cannot read that folder: {e}"),
                 });
-                self.root = None;
+                self.replace_root(None);
                 self.tree_rev = self.tree_rev.wrapping_add(1);
                 self.last_summary = Some(ScanSummary {
                     files,
@@ -756,7 +771,7 @@ impl BytewhifferApp {
             }
             PreparedOutcome::Panicked => {
                 self.error = Some("The scan thread panicked.".to_owned());
-                self.root = None;
+                self.replace_root(None);
                 self.tree_rev = self.tree_rev.wrapping_add(1);
                 self.last_summary = Some(ScanSummary {
                     files,
@@ -774,6 +789,14 @@ impl BytewhifferApp {
     /// is the single point at which the HUD can disappear.
     fn scan_active(&self) -> bool {
         self.scan_controller.is_active()
+    }
+
+    fn replace_root(&mut self, root: Option<Node>) {
+        self.root = root;
+        self.tree_identity = self.tree_identity.wrapping_add(1);
+        if self.tree_identity == 0 {
+            self.tree_identity = 1;
+        }
     }
 
     fn delete_available(&self) -> bool {
@@ -1398,13 +1421,27 @@ impl BytewhifferApp {
         resolve_nest_gate(self.abstraction)
     }
 
-    /// Recomputes the drawer's analytics if the focus or the tree has
-    /// changed since they were last computed; a no-op otherwise. Keeps the
-    /// whole-subtree walks off the per-frame render path.
+    /// Recomputes the drawer's analytics if the focus, authoritative root, or
+    /// focused subtree structure has changed since they were last computed; a
+    /// no-op otherwise. Keeps the whole-subtree walks off the per-frame render
+    /// path.
     fn refresh_insights(&mut self) {
-        let key = (self.focus.clone(), self.tree_rev);
+        let focused_structural_rev = self
+            .root
+            .as_ref()
+            .map(|root| root.find(&self.focus).unwrap_or(root).structural_rev())
+            .unwrap_or(0);
+        let key = InsightsKey {
+            focus: self.focus.clone(),
+            tree_identity: self.tree_identity,
+            focused_structural_rev,
+        };
         if self.insights_cache.is_some() && self.insights_key.as_ref() == Some(&key) {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.insights_refreshes += 1;
         }
         let data = {
             let Some(root) = &self.root else {
@@ -3224,6 +3261,87 @@ mod layout_cache_tests {
         }
 
         assert_eq!(cache.stats(), (0, 4, 1));
+    }
+}
+
+#[cfg(test)]
+mod insights_cache_tests {
+    use super::*;
+
+    fn tree() -> Node {
+        let mut root = Node::new("root".to_owned(), PathBuf::from("root"), 0, true);
+        root.insert(Path::new("focused/old.bin"), 10, false);
+        root.insert(Path::new("sibling/old.bin"), 20, false);
+        root
+    }
+
+    fn prepared_app() -> BytewhifferApp {
+        let mut app = BytewhifferApp::new();
+        app.replace_root(Some(tree()));
+        app
+    }
+
+    #[test]
+    fn pointer_only_frames_reuse_insights() {
+        let mut app = prepared_app();
+
+        app.refresh_insights();
+        app.refresh_insights();
+
+        assert_eq!(app.insights_refreshes, 1);
+    }
+
+    #[test]
+    fn sibling_mutation_reuses_focused_insights() {
+        let mut app = prepared_app();
+        app.focus = vec!["focused".to_owned()];
+        app.refresh_insights();
+
+        app.root
+            .as_mut()
+            .unwrap()
+            .insert(Path::new("sibling/new.bin"), 30, false);
+        app.tree_rev = app.tree_rev.wrapping_add(1);
+        app.refresh_insights();
+
+        assert_eq!(app.insights_refreshes, 1);
+    }
+
+    #[test]
+    fn mutation_under_focus_invalidates_insights() {
+        let mut app = prepared_app();
+        app.focus = vec!["focused".to_owned()];
+        app.refresh_insights();
+
+        app.root
+            .as_mut()
+            .unwrap()
+            .insert(Path::new("focused/new.bin"), 30, false);
+        app.tree_rev = app.tree_rev.wrapping_add(1);
+        app.refresh_insights();
+
+        assert_eq!(app.insights_refreshes, 2);
+    }
+
+    #[test]
+    fn authoritative_root_replacement_invalidates_matching_revisions() {
+        let mut app = prepared_app();
+        app.refresh_insights();
+        let old_revision = app.root.as_ref().unwrap().structural_rev();
+
+        let mut replacement = Node::new(
+            "replacement".to_owned(),
+            PathBuf::from("replacement"),
+            0,
+            true,
+        );
+        replacement.insert(Path::new("first.bin"), 10, false);
+        replacement.insert(Path::new("second.bin"), 20, false);
+        app.replace_root(Some(replacement));
+        assert_eq!(app.root.as_ref().unwrap().structural_rev(), old_revision);
+        app.refresh_insights();
+
+        assert_eq!(app.insights_refreshes, 2);
     }
 }
 

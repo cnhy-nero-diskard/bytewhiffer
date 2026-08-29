@@ -116,9 +116,11 @@ pub enum ScanOutcome {
 
 /// Shared, lock-free progress state a caller can poll from another thread to
 /// show "N files / X GB scanned so far" while a scan is in flight. Counters
-/// only ever increase during a scan; `complete` flips once after the scanner
-/// and background display-tree preparation finish, so pollers have a final
-/// "no longer in flight" state to observe.
+/// only ever increase during a scan. Engines publish scan-phase completion via
+/// [`ScanProgress::mark_complete`]; the controller publishes generation
+/// completion only after any display-tree preparation has finished. The two
+/// states are separate so a generation can never reopen a completion flag that
+/// a poller has already observed.
 #[derive(Default)]
 pub struct ScanProgress {
     pub files_scanned: AtomicU64,
@@ -128,7 +130,10 @@ pub struct ScanProgress {
     conversion_nodes_finished: AtomicU64,
     conversion_started: AtomicBool,
     conversion_complete: AtomicBool,
-    complete: AtomicBool,
+    scan_complete: AtomicBool,
+    generation_complete: AtomicBool,
+    #[cfg(test)]
+    conversion_pause: AtomicBool,
 }
 
 impl ScanProgress {
@@ -137,6 +142,8 @@ impl ScanProgress {
         self.conversion_nodes_finished.store(0, Ordering::Relaxed);
         self.conversion_started.store(true, Ordering::Release);
         self.conversion_complete.store(false, Ordering::Release);
+        #[cfg(test)]
+        self.wait_for_conversion_resume();
     }
 
     pub(crate) fn conversion_node_finished(&self) {
@@ -179,17 +186,43 @@ impl ScanProgress {
         )
     }
 
-    pub(crate) fn mark_incomplete(&self) {
-        self.complete.store(false, Ordering::Release);
+    /// Marks the scanner's traversal as finished. This is the completion
+    /// handshake required of every [`ScanEngine`]; it is intentionally distinct
+    /// from [`ScanProgress::is_complete`], which is reserved for the complete
+    /// scan generation after controller-side preparation.
+    pub fn mark_complete(&self) {
+        self.scan_complete.store(true, Ordering::Release);
     }
 
-    pub fn mark_complete(&self) {
-        self.complete.store(true, Ordering::Release);
+    pub(crate) fn mark_generation_complete(&self) {
+        self.generation_complete.store(true, Ordering::Release);
     }
 
     #[allow(dead_code)]
     pub fn is_complete(&self) -> bool {
-        self.complete.load(Ordering::Relaxed)
+        self.generation_complete.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_scan_complete(&self) -> bool {
+        self.scan_complete.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_conversion(&self) {
+        self.conversion_pause.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_conversion(&self) {
+        self.conversion_pause.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn wait_for_conversion_resume(&self) {
+        while self.conversion_pause.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -309,6 +342,7 @@ pub trait ScanEngine: Send + Sync {
     /// outcome. Individual unreadable entries are skipped and simply absent
     /// from a successful tree. Implementations must honor `ctx.cancel`, keep
     /// `ctx.progress` monotonically increasing, and call `mark_complete`
-    /// before returning.
+    /// before returning. The controller marks the generation complete after
+    /// any post-scan display-tree preparation.
     fn scan(&self, target: &Path, ctx: &ScanContext) -> ScanOutcome;
 }
